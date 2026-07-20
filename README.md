@@ -17,12 +17,13 @@ current monitor. This is a DIY equivalent of a BC Biomedical ESU-2050 analyzer.
 
 ## Quick start (any Windows PC)
 
-**Option A — grab the prebuilt exe** (once you've run a `build.bat` release):
-1. Copy `esu_test.exe` to the PC.
+**Option A — prebuilt exe, NO Python needed** (recommended for techs):
+1. Download `esu_test.exe` from the [**Releases**](../../releases/latest) page.
+   (Python and all libraries are bundled inside — nothing to install.)
 2. Do the **one-time driver step** (below).
 3. Double-click it → GUI opens.
 
-**Option B — run from source:**
+**Option B — run from source** (needs Python 3):
 ```
 pip install -r requirements.txt
 python esu_test.py            # no args -> GUI

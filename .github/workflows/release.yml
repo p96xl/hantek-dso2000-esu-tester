@@ -1,0 +1,50 @@
+name: build-exe
+
+# Builds the Windows GUI exe on a clean runner and attaches it to a Release.
+# Push a tag like v1.0.0 to cut a release; or run manually to get a downloadable artifact.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -r requirements.txt libusb-package pyinstaller
+
+      - name: Fetch bundled libusb-1.0.dll
+        run: python -c "import libusb_package,glob,os,shutil,sys; f=glob.glob(os.path.join(os.path.dirname(libusb_package.__file__),'**','libusb-1.0.dll'),recursive=True); shutil.copy(f[0],'.') if f else sys.exit('libusb-1.0.dll not found')"
+
+      - name: Build one-file exe
+        run: pyinstaller --onefile --windowed --collect-all pyvisa --collect-all pyvisa_py --collect-all usb --add-binary "libusb-1.0.dll;." esu_test.py
+
+      - name: Attach exe to the Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/esu_test.exe
+          body: |
+            **Prebuilt Windows GUI — download `esu_test.exe` below.**
+
+            One-time setup per PC:
+            1. Scope: **Utility → I/O → USB Device = Computer/USBTMC**.
+            2. Bind the scope's USBTMC interface to **WinUSB** with [Zadig](https://zadig.akeo.ie/).
+
+            Then double-click `esu_test.exe`. See the README for bench wiring and scaling constants.
+
+      - name: Upload artifact (manual runs, no tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: esu_test-exe
+          path: dist/esu_test.exe
