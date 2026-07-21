@@ -35,6 +35,44 @@ CODES_PER_DIV = 25.0   # ponytail: DSO2000 ADC = 25 codes/div (from ref impl). V
 # ---------------------------------------------------------------------------
 
 BLOCK = 2000           # samples are interleaved in 2000-byte per-channel blocks
+VDIV, HDIV = 8, 14     # DSO2000 grid: 8 vertical, 14 horizontal divisions
+
+
+def _snap125(x, lo, hi, up=True):
+    """Snap x to a 1-2-5 gear, clamped. up=True: smallest gear >= x (never overflow the range,
+    for V/div). up=False: nearest gear (for timebase, so cycle count lands on target)."""
+    import math
+    if x <= 0:
+        return lo
+    dec = 10 ** math.floor(math.log10(x))
+    gears = [m * dec for m in (1, 2, 5, 10)]
+    if up:
+        pick = next((g for g in gears if g >= x - 1e-15), gears[-1])
+    else:
+        pick = min(gears, key=lambda g: abs(g - x))
+    return min(max(pick, lo), hi)
+
+
+def autoscale(scope, targets=(1, 2), cycles=6):
+    """Fill the ADC so a small signal stops reading as noise.
+    The #1 cause of a 'noisy' trace here is a signal spanning only a few ADC codes.
+    Per channel: measure peak, set V/div so peak sits at ~3 of 8 divisions (6-div span,
+    headroom left). Then set the timebase from CH1's frequency to show ~`cycles` cycles."""
+    import numpy as np, time
+    chans, dt = capture(scope)                       # quick read under HRES + BWLimit
+    for ch in targets:
+        if ch not in chans:
+            continue
+        pk = float(np.max(np.abs(chans[ch]))) or 1e-3
+        per_div = _snap125(pk / 3.0, 1e-3, 1e5)      # peak at ~3 div; snap up so it can't clip
+        scope.write(f':CHANnel{ch}:OFFSet 0')
+        scope.write(f':CHANnel{ch}:SCALe {per_div:g}')
+    if 1 in chans:
+        f = dom_freq(chans[1], dt)
+        if f and np.isfinite(f):
+            # nearest gear so the on-screen cycle count actually lands near `cycles`
+            scope.write(f':TIMebase:SCALe {_snap125((cycles / f) / HDIV, 2e-9, 50, up=False):g}')
+    time.sleep(0.3)                                  # let the new gears settle before the real capture
 
 
 def connect(resource=None):
@@ -44,7 +82,12 @@ def connect(resource=None):
     except Exception:
         rm = pyvisa.ResourceManager('@py')     # else pure-python + libusb
     if resource is None:
-        res = [r for r in rm.list_resources() if 'USB' in r and 'INSTR' in r]
+        try:
+            res = list(rm.list_resources('USB?*::INSTR'))   # filtered -> skips slow TCPIP/serial probing
+        except Exception:
+            res = []
+        if not res:
+            res = [r for r in rm.list_resources() if 'USB' in r and 'INSTR' in r]
         if not res:
             raise RuntimeError("No USBTMC instrument found. Saw: " + str(rm.list_resources()) +
                      "\n  1) Scope: Utility -> I/O -> USB Device = Computer/USBTMC.\n"
@@ -74,12 +117,15 @@ def capture(scope, acq='HRESolution', count=64, bwlimit=True, fresh=True):
         time.sleep(1.5 if acq and acq.upper().startswith('AVER') else 0.4)
     scope.write(':STOP')                        # freeze for a coherent read
     buf = bytearray()
-    total, meta, guard = None, None, 0
+    total, meta, guard, retries = None, None, 0, 0
     while guard < 10000:
         scope.write('PRIVate:WAVeform:DATA:ALL?')
         raw = bytes(scope.read_raw())
-        if raw[:2] != b'#9':
-            raise RuntimeError(f"bad packet header: {raw[:16]!r}")
+        if len(raw) < 29 or raw[:2] != b'#9':   # 29-byte header (#9 + 9+9+9 digits). Short/empty = scope not ready.
+            if len(buf) == 0 and retries < 20:  # only retry before real data has landed (re-query restarts at off=0)
+                retries += 1; time.sleep(0.15); continue
+            raise RuntimeError(f"bad/empty waveform packet (len {len(raw)}, {raw[:16]!r}) after {retries} retries — "
+                               "check a signal is present and the scope is triggering/acquiring")
         total = int(raw[11:20]); off = int(raw[20:29])   # off = bytes already uploaded = this chunk's start
         if off == 0:
             meta = raw[29:128]                  # channel-enable etc. live in the first packet's header
@@ -118,23 +164,58 @@ def capture(scope, acq='HRESolution', count=64, bwlimit=True, fresh=True):
 
 
 def dom_freq(x, dt):
+    """Dominant frequency, CALCULATED from the trace — this firmware's :MEASure SCPI is dead,
+    so the scope's own counter can't be read over USB. Method: measure the period from
+    linearly-interpolated zero-crossings across the whole record (precise for a clean carrier),
+    validated against a Hann-FFT peak so harmonic/noise miscounts fall back to the FFT estimate."""
     import numpy as np
+    x = np.asarray(x, float)
     x = x - np.mean(x)
-    sp = np.abs(np.fft.rfft(x))
-    sp[0] = 0
+    N = len(x); span = N * dt
+    sp = np.abs(np.fft.rfft(x * np.hanning(N))); sp[0] = 0
     k = int(np.argmax(sp))
-    return k / (len(x) * dt) if k else float('nan')
+    if k <= 0:
+        return float('nan')
+    if k < len(sp) - 1:                              # parabolic-interpolated FFT peak: robust ballpark
+        y1, y2, y3 = sp[k - 1], sp[k], sp[k + 1]; d = y1 - 2 * y2 + y3
+        f_fft = (k + (0.5 * (y1 - y3) / d if d else 0.0)) / span
+    else:
+        f_fft = k / span
+    neg = x < 0                                      # refine via upward zero crossings (x[i]<0, x[i+1]>=0)
+    ups = np.where(neg[:-1] & ~neg[1:])[0]
+    if len(ups) >= 2:
+        tc = ups + x[ups] / (x[ups] - x[ups + 1])    # sub-sample crossing index (linear interp)
+        f_zc = (len(tc) - 1) / ((tc[-1] - tc[0]) * dt)
+        if abs(f_zc - f_fft) < 1.5 / span:           # within ~1 FFT bin -> trust the precise one
+            return f_zc
+    return f_fft
 
 
-def metrics(V, I, R, dt):
-    """V, I already in real volts/amps. Returns the measurement + 3 power estimates."""
+def scope_meas(scope, item, ch=1):
+    """Read a hardware measurement off the scope: :MEASure:CHANnel<n>:ITEM? <item> -> float, or None.
+    fw 1.0.8 quirks (proven via scpi_scan.py): query the item DIRECTLY — do NOT :MEASure:ENABle,
+    set :ITEM, or interleave :SYSTem:ERRor?; any of those desync the response buffer. VRMS is broken
+    (returns the frequency) so only FREQuency/PERiod/VPP/VMAX/VAVG are usable. Occasional timeout -> None."""
+    old = scope.timeout
+    try:
+        scope.timeout = 2000                    # short: a flaky query fails fast instead of hanging 15 s
+        return float(scope.query(f':MEASure:CHANnel{ch}:ITEM? {item}').strip())
+    except Exception:
+        return None
+    finally:
+        scope.timeout = old
+
+
+def metrics(V, I, R, dt, freq=None):
+    """V, I already in real volts/amps. Returns the measurement + 3 power estimates.
+    freq: if given (e.g. the scope's own counter), used verbatim; else computed from the trace."""
     import numpy as np
     Vrms = float(np.sqrt(np.mean(V**2))); Irms = float(np.sqrt(np.mean(I**2)))
     Vpk = float(np.max(np.abs(V)))
     return {
         'Vrms': Vrms, 'Vpp': float(np.ptp(V)), 'Vpeak': Vpk,
         'Irms': Irms, 'Ipeak': float(np.max(np.abs(I))),
-        'Freq_Hz': dom_freq(V, dt),
+        'Freq_Hz': freq if freq is not None else dom_freq(V, dt),
         'CrestFactor': Vpk / Vrms if Vrms else float('nan'),
         'P_from_V (Vrms^2/R)': Vrms**2 / R,
         'P_from_I (Irms^2*R)': Irms**2 * R,
@@ -175,17 +256,25 @@ td{{border:1px solid #ccc;padding:4px 10px}}h1{{font-size:20px}}img{{max-width:7
     print("Report ->", out_path, "(open in browser, Ctrl+P -> Save as PDF)")
 
 
-def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution', count=64):
-    """Capture, compute, write report. Returns (metrics dict, report path). Shared by CLI + GUI."""
+def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution', count=64,
+             turns=1, auto=True, cycles=6):
+    """Capture, compute, write report. Returns (metrics dict, report path). Shared by CLI + GUI.
+    turns: # of passes of the ESU wire through the Pearson coil (Pearson reads amp-TURNS,
+           so N passes gives N x the signal off the noise floor; we divide amps back by N).
+    auto:  autoscale the scope V/div + timebase to fill the ADC before capturing."""
     import numpy as np
     scope = connect(resource)
     try:
+        if auto:
+            autoscale(scope, cycles=cycles)
         chans, dt = capture(scope, acq=acq, count=count)
         if 1 not in chans or 2 not in chans:
             raise RuntimeError(f"Need CH1 (voltage) and CH2 (current) enabled; captured {sorted(chans)}")
-        V = chans[1] * PROBE_RATIO          # real volts across load
-        I = chans[2] / COIL_V_PER_A         # real amps through load
-        mets = metrics(V, I, load, dt)      # metrics from RAW current — smoothing is display-only
+        V = chans[1] * PROBE_RATIO              # real volts across load
+        I = chans[2] / COIL_V_PER_A / turns     # real amps: undo the coil V/A and the N turns
+        fs = scope_meas(scope, 'FREQuency')     # scope's own counter (matches the display); None if it times out
+        fs = fs if fs and 1e3 < fs < 1e8 else None
+        mets = metrics(V, I, load, dt, freq=fs)  # metrics from RAW current — smoothing is display-only
         img = plot(np.arange(len(V)) * dt, V, I, out.replace('.html', '.png'), smooth)
         # resolution guard: warn if a channel's signal barely spans the ADC (coarse V/div = garbage numbers)
         codes = {ch: np.ptp(chans[ch]) / (float(scope.query(f':CHANnel{ch}:SCALe?')) / CODES_PER_DIV)
@@ -197,7 +286,8 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
         mets['CH2 ADC codes (pp)'] = codes[2]
         info = {
             'Unit S/N': sn, 'Mode': mode, 'Front-panel setpoint (W)': setpoint,
-            'Load (ohm)': load, 'Date': datetime.datetime.now().isoformat(timespec='seconds'),
+            'Load (ohm)': load, 'Pearson coil turns': turns,
+            'Date': datetime.datetime.now().isoformat(timespec='seconds'),
             'Instrument': scope.query('*IDN?').strip(), 'Samples/ch': len(V), 'dt (s)': dt,
         }
         if warn:
@@ -210,9 +300,88 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
 
 def run(args):
     mets, _ = generate(args.resource, args.sn, args.mode, args.setpoint, args.load,
-                       args.out, args.smooth, args.acq, args.count)
+                       args.out, args.smooth, args.acq, args.count, args.turns,
+                       not args.no_autoscale, args.cycles)
     print("  P (Vrms^2/R) = %.1f W | P (Irms^2*R) = %.1f W | P (mean v*i) = %.1f W"
           % (mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'], mets['P_from_VxI (mean v*i)']))
+
+
+def session(args):
+    """Power-sweep mode: connect + autoscale ONCE, then capture on each Enter with the
+    scope held open — skips the per-test reconnect + re-autoscale (the slow parts).
+    Each capture prints the 3-way power and appends a row to <out>_sweep.csv."""
+    import csv, os
+    scope = connect(args.resource)
+    try:
+        if not args.no_autoscale:
+            print("Set the ESU to your HIGHEST sweep power first, then autoscaling so nothing clips at the top...")
+            autoscale(scope, cycles=args.cycles)
+        csvpath = args.out.replace('.html', '') + '_sweep.csv'
+        new = not os.path.exists(csvpath)
+        f = open(csvpath, 'a', newline='')
+        w = csv.writer(f)
+        if new:
+            w.writerow(['setpoint_W', 'P_Vrms2R', 'P_Irms2R', 'P_meanVI', 'Vrms', 'Irms', 'Freq_Hz'])
+        print("\nSweep. Dial a power, type the watts + Enter to capture. 'a'=re-autoscale, 'q'=quit.")
+        while True:
+            s = input("setpoint W> ").strip()
+            if s.lower() in ('q', 'quit', 'exit'):
+                break
+            if s.lower() in ('a', 'auto'):
+                autoscale(scope, cycles=args.cycles); print("  re-autoscaled."); continue
+            chans, dt = capture(scope, acq=args.acq, count=args.count)
+            if 1 not in chans or 2 not in chans:
+                print("  !! need CH1 (voltage) + CH2 (current) enabled"); continue
+            V = chans[1] * PROBE_RATIO
+            I = chans[2] / COIL_V_PER_A / args.turns
+            fs = scope_meas(scope, 'FREQuency')
+            fs = fs if fs and 1e3 < fs < 1e8 else None
+            m = metrics(V, I, args.load, dt, freq=fs)
+            print("  P: Vrms2/R=%.1f  Irms2*R=%.1f  v*i=%.1f W  |  Vrms=%.1f Irms=%.3f f=%.0fHz" % (
+                m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)'], m['P_from_VxI (mean v*i)'],
+                m['Vrms'], m['Irms'], m['Freq_Hz']))
+            w.writerow([s, m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)'],
+                        m['P_from_VxI (mean v*i)'], m['Vrms'], m['Irms'], m['Freq_Hz']])
+            f.flush()
+        f.close()
+        print("Sweep saved ->", csvpath)
+    finally:
+        scope.close()
+
+
+def live(args):
+    """Rolling live waveform: re-capture + redraw until you close the window.
+    NOT true streaming — the DSO2000 has no streaming SCPI, only whole-frame block reads,
+    so refresh is ~1-3 Hz at shallow memory. ponytail: poll-redraw is the ceiling this
+    firmware allows; a faster path would need streaming SCPI the scope doesn't have."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    scope = connect(args.resource)
+    try:
+        if not args.no_autoscale:
+            autoscale(scope, cycles=args.cycles)
+        plt.ion()
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+        print("Live view — close the window to stop.")
+        while plt.fignum_exists(fig.number):
+            chans, dt = capture(scope, acq=args.acq, count=args.count)
+            if 1 not in chans or 2 not in chans:
+                print("need CH1 (voltage) + CH2 (current) enabled"); break
+            V = chans[1] * PROBE_RATIO
+            I = chans[2] / COIL_V_PER_A / args.turns
+            t = np.arange(len(V)) * dt * 1e6
+            fs = scope_meas(scope, 'FREQuency')
+            fs = fs if fs and 1e3 < fs < 1e8 else None
+            m = metrics(V, I, args.load, dt, freq=fs)
+            a1.clear(); a2.clear()
+            a1.plot(t, V, lw=.8); a1.set_ylabel('Voltage (V)'); a1.grid(alpha=.3)
+            a1.set_title("v·i=%.1f W  |  Vrms=%.1f  Irms=%.3f  f=%.0f Hz" % (
+                m['P_from_VxI (mean v*i)'], m['Vrms'], m['Irms'], m['Freq_Hz']))
+            a2.plot(t, I, lw=.8, color='tab:red'); a2.set_ylabel('Current (A)')
+            a2.set_xlabel('time (µs)'); a2.grid(alpha=.3)
+            plt.pause(0.05)
+    finally:
+        scope.close()
 
 
 def gui():
@@ -224,6 +393,7 @@ def gui():
     root.geometry("440x310")
     form = [("Unit S/N", "sn", ""), ("Mode", "mode", "cut 50W"),
             ("Setpoint (W)", "setpoint", ""), ("Load (ohm)", "load", "500"),
+            ("Coil turns", "turns", "1"),           # passes of ESU wire through the Pearson: more turns = cleaner current
             ("Current smoothing", "smooth", "0")]   # display-only; 0=off, try 5-15 if the current plot looks noisy
     ent = {}
     for i, (label, key, default) in enumerate(form):
@@ -249,7 +419,8 @@ def gui():
             sn = ent['sn'].get().strip() or 'NA'
             out = f"esu_report_{sn}.html".replace(' ', '_')
             mets, path = generate(None, sn, ent['mode'].get(), ent['setpoint'].get(),
-                                  float(ent['load'].get()), out, int(ent['smooth'].get() or 0))
+                                  float(ent['load'].get()), out, int(ent['smooth'].get() or 0),
+                                  turns=int(ent['turns'].get() or 1))
             status.set("P: Vrms²/R=%.1fW · Irms²·R=%.1fW · v·i=%.1fW · freq=%.0fHz" % (
                 mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'],
                 mets['P_from_VxI (mean v*i)'], mets['Freq_Hz']))
@@ -282,6 +453,8 @@ def calcheck(resource=None):
     print("acquisition settings the scope reports back:")
     print("  :ACQuire:TYPE?     =", q(':ACQuire:TYPE?'), " (want HRES)")
     print("  :ACQuire:COUNt?    =", q(':ACQuire:COUNt?'))
+    print("  :ACQuire:POINts?   =", q(':ACQuire:POINts?'), " (small = fast USB transfer; deep memory is slow)")
+    print("  :ACQuire:SRATe?    =", q(':ACQuire:SRATe?'))
     for ch in (1, 2):
         print(f"  CH{ch}: BWLimit={q(f':CHANnel{ch}:BWLimit?')} SCALe={q(f':CHANnel{ch}:SCALe?')} "
               f"OFFSet={q(f':CHANnel{ch}:OFFSet?')}")
@@ -289,6 +462,10 @@ def calcheck(resource=None):
     for ch, v in chans.items():
         print(f"  CH{ch}: mean={np.mean(v):+.4f}V  std(noise)={np.std(v):.4f}V  "
               f"Vpp={np.ptp(v):.4f}V  ~codes_pp={np.ptp(v) / (float(q(f':CHANnel{ch}:SCALe?')) / CODES_PER_DIV):.1f}")
+    fs = scope_meas(scope, 'FREQuency')
+    import numpy as np
+    print(f"frequency: scope :MEASure counter = {fs}  vs computed from CH1 = {dom_freq(chans[1], dt):.0f} Hz"
+          if fs else f"frequency: scope counter timed out; computed from CH1 = {dom_freq(chans[1], dt):.0f} Hz")
     print(f"dt={dt}s/sample. mean = DC offset, std = noise. If :ACQuire:TYPE? is NOT HRES, the firmware rejected it.")
     scope.close()
 
@@ -347,12 +524,24 @@ def demo():
         assert abs(m[key] - 20) < 0.1, (key, m[key])
     assert abs(m['Freq_Hz'] - 4000) < 20, m['Freq_Hz']
     assert abs(m['Vrms'] - 100) < 0.1
-    print("demo OK — 20 W by all three methods, freq 4 kHz, Vrms 100 V")
+    # _snap125 must round UP to the next 1-2-5 gear so the chosen range never clips the signal
+    assert _snap125(0.1, 1e-3, 1e5) == 0.1 and _snap125(0.11, 1e-3, 1e5) == 0.2
+    assert _snap125(3, 1e-3, 1e5) == 5 and _snap125(0.03, 1e-3, 1e5) == 0.05
+    assert _snap125(1e-6, 1e-3, 1e5) == 1e-3 and _snap125(1e9, 1e-3, 1e5) == 1e5  # clamped
+    assert _snap125(0.76, 1e-9, 50, up=False) == 1 and _snap125(0.6, 1e-9, 50, up=False) == 0.5  # nearest gear
+    # frequency at a FRACTIONAL FFT bin (like 471 kHz in a 32 µs window) — interp must beat the ~31 kHz bin grid
+    t2 = np.linspace(0, 32e-6, 4000, endpoint=False)
+    f_est = dom_freq(np.sin(2 * np.pi * 471000 * t2), t2[1] - t2[0])
+    assert abs(f_est - 471000) < 3000, f_est   # raw bin-picker would land on 500 kHz (29 kHz off)
+    assert metrics(V, I, 500, t[1] - t[0], freq=472000)['Freq_Hz'] == 472000  # scope-supplied freq used verbatim
+    print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, snap125")
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--gui', action='store_true', help='launch the tech GUI (also the default on double-click)')
+    ap.add_argument('--session', action='store_true', help='power-sweep: connect+autoscale once, capture on each Enter, log to CSV (fast for many setpoints)')
+    ap.add_argument('--live', action='store_true', help='rolling live waveform window (poll+redraw; close window to stop)')
     ap.add_argument('--demo', action='store_true', help='run self-test, no scope')
     ap.add_argument('--list', action='store_true', help='list VISA resources + IDN')
     ap.add_argument('--calcheck', action='store_true', help='capture + print Vpp to verify scaling')
@@ -362,12 +551,17 @@ if __name__ == '__main__':
     ap.add_argument('--mode', default='?', help='e.g. "cut 50W" / "coag"')
     ap.add_argument('--setpoint', default='?', help='front-panel watts')
     ap.add_argument('--load', type=float, default=500, help='load resistance (ohm)')
+    ap.add_argument('--turns', type=int, default=1, help='passes of the ESU wire through the Pearson coil (N turns = Nx signal, amps divided back by N)')
+    ap.add_argument('--no-autoscale', action='store_true', help='skip auto V/div + timebase; use the scope as-is')
+    ap.add_argument('--cycles', type=int, default=6, help='approx # of waveform cycles to show on screen (autoscale timebase)')
     ap.add_argument('--smooth', type=int, default=0, help='display-only current smoothing window (samples); 0=off')
     ap.add_argument('--acq', default='HRESolution', help='acquisition: NORMal|AVERage|PEAK|HRESolution (HRES cuts noise)')
     ap.add_argument('--count', type=int, default=64, help='averages when --acq AVERage')
     ap.add_argument('--out', default='esu_report.html')
     a = ap.parse_args()
     if a.gui or len(sys.argv) == 1: gui()   # no args (double-click) -> GUI
+    elif a.session: session(a)
+    elif a.live: live(a)
     elif a.demo: demo()
     elif a.list: list_resources()
     elif a.calcheck: calcheck(a.resource)

@@ -11,6 +11,7 @@ libusb-1.0.dll
 # generated reports (may contain unit serials)
 esu_report*.html
 esu_report*.png
+esu_report*.csv
 *.bmp
 build_log.txt
 

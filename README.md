@@ -63,21 +63,58 @@ Current always needs `÷ COIL_V_PER_A` because the scope only shows volts.
 
 ```
 python esu_test.py                                   # GUI (default on double-click)
-python esu_test.py --sn ELLMAN123 --mode "cut 50W" --load 500 --setpoint 50
-python esu_test.py --list                            # list instruments + *IDN?
-python esu_test.py --calcheck                        # verify scaling + acquisition settings
-python esu_test.py --demo                            # self-test, no scope
+python esu_test.py --sn ELLMAN123 --mode "cut 50W" --load 500 --setpoint 50 --turns 3
 ```
 
-Useful flags: `--acq HRESolution|AVERage|NORMal` (noise reduction; HRES default),
-`--count N` (averages), `--smooth N` (display-only current smoothing), `--load <ohm>`.
+### Modes (pick one; default is the GUI)
+
+| Flag | What it does | Example |
+|------|--------------|---------|
+| *(none)* | Launch the GUI (also on double-click) | `python esu_test.py` |
+| `--gui` | Force the GUI | `python esu_test.py --gui` |
+| `--session` | **Power-sweep mode** — connect + autoscale **once**, then capture on each Enter with the scope held open. Logs every shot to `<out>_sweep.csv`. Use this for a 1→70 W sweep instead of one slow process per setpoint | `python esu_test.py --session --load 200 --turns 3` |
+| `--live` | **Live waveform window** — poll + redraw until you close it. Not true streaming (the DSO2000 has no streaming SCPI, only whole-frame reads → ~1–3 Hz), but enough to watch the wave change as you turn the dial | `python esu_test.py --live --load 200 --turns 3` |
+| `--demo` | Self-test the math, no scope needed | `python esu_test.py --demo` |
+| `--list` | List VISA resources + `*IDN?` | `python esu_test.py --list` |
+| `--calcheck` | Capture + print raw scope-volts / noise / ADC codes to verify scaling | `python esu_test.py --calcheck` |
+| `--probe` | Dump the waveform packet structure (reassembly diagnostic) | `python esu_test.py --probe` |
+
+### Report options (the main capture-and-report path)
+
+| Flag | Default | What it does | Example |
+|------|---------|--------------|---------|
+| `--sn` | `?` | ESU unit serial number (report header + output filename) | `--sn FORCEFXC` |
+| `--mode` | `?` | Free-text mode label | `--mode "bipolar std 30W"` |
+| `--setpoint` | `?` | Front-panel watts (for the report) | `--setpoint 30` |
+| `--load` | `500` | Load resistance in ohm — **must be the real value**, the `Vrms²/R` and `Irms²·R` powers depend on it | `--load 200` |
+| `--turns` | `1` | Passes of the ESU wire through the Pearson coil. Coil reads amp-**turns**, so N turns = N× signal off the noise floor; amps are divided back by N in software | `--turns 3` |
+| `--cycles` | `6` | Approx # of waveform cycles autoscale puts on screen (snaps to nearest scope timebase gear) | `--cycles 5` |
+| `--no-autoscale` | off | Skip auto V/div + timebase; use the scope exactly as set | `--no-autoscale` |
+| `--acq` | `HRESolution` | Acquisition type: `HRESolution` \| `AVERage` \| `PEAK` \| `NORMal` (HRES cuts noise; use `NORMal` for one-shot bursts) | `--acq AVERage` |
+| `--count` | `64` | Number of averages when `--acq AVERage` | `--count 128` |
+| `--smooth` | `0` | Display-only moving-average on the current plot (samples); does **not** touch the RMS/power numbers | `--smooth 10` |
+| `--resource` | auto | Explicit VISA resource string (default: autodetect USB) | `--resource USB0::...::INSTR` |
+| `--out` | `esu_report.html` | Output HTML path (`.png` written alongside) | `--out force_fxc.html` |
 
 Output: `esu_report*.html` (embedded plot + measurements, **Ctrl+P → Save as PDF**) and a `.png`.
-The report flags **low ADC resolution** if a channel's signal spans under ~10 codes (turn its V/div down).
+The report flags **low ADC resolution** if a channel's signal spans under ~10 codes (turn its V/div down, or `--turns` more).
+
+### The trust rule — read the three power numbers
+Every report computes power three independent ways: `Vrms²/R`, `Irms²·R`, and `mean(v·i)`.
+**When all three agree, the scaling is correct and the number is real.** When they diverge,
+one channel is mis-scaled and the divergence tells you which:
+- `Irms²·R` way off, others low → **CH1 voltage probe ratio wrong** (e.g. a ×10 probe left on ×1 → voltage reads 10× low). Fix it on the scope; the tool trusts the scope's own probe ratio.
+- `Vrms²/R` vs `Irms²·R` disagree → the load `R` isn't its nominal value (heating/drift) or there's reactance.
+- Clean voltage + near-zero current → the current loop is **open** (or both conductors pass through the coil and cancel).
+
+### Finding the right load
+ESU power peaks at a rated load and rolls off both sides (too low = current-limited, too high = voltage-limited).
+Sweep `--load` and watch `P (mean v·i)` climb toward the dial; the peak is the mode's rated impedance.
+(Force FX-C bipolar Standard: ~100–200 Ω works; 50 Ω and 500 Ω both under-deliver.)
 
 ### GUI (for techs)
-Double-click the exe → fill S/N, mode, setpoint, load → **Test Connection** → **Capture & Report**.
-The report opens automatically in the browser.
+Double-click the exe → fill S/N, mode, setpoint, load, **Coil turns** → **Test Connection** → **Capture & Report**.
+Autoscale runs automatically. The report opens in the browser.
 
 ---
 
