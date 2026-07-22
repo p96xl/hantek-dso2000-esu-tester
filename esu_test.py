@@ -257,7 +257,7 @@ td{{border:1px solid #ccc;padding:4px 10px}}h1{{font-size:20px}}img{{max-width:7
 
 
 def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution', count=64,
-             turns=1, auto=True, cycles=6):
+             turns=1, auto=True, cycles=6, vmult=1.0):
     """Capture, compute, write report. Returns (metrics dict, report path). Shared by CLI + GUI.
     turns: # of passes of the ESU wire through the Pearson coil (Pearson reads amp-TURNS,
            so N passes gives N x the signal off the noise floor; we divide amps back by N).
@@ -270,7 +270,7 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
         chans, dt = capture(scope, acq=acq, count=count)
         if 1 not in chans or 2 not in chans:
             raise RuntimeError(f"Need CH1 (voltage) and CH2 (current) enabled; captured {sorted(chans)}")
-        V = chans[1] * PROBE_RATIO              # real volts across load
+        V = chans[1] * PROBE_RATIO * vmult     # real volts across load (vmult = load-tap ratio, e.g. 3 if probing 1 of 3 equal series Rs)
         I = chans[2] / COIL_V_PER_A / turns     # real amps: undo the coil V/A and the N turns
         fs = scope_meas(scope, 'FREQuency')     # scope's own counter (matches the display); None if it times out
         fs = fs if fs and 1e3 < fs < 1e8 else None
@@ -286,7 +286,7 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
         mets['CH2 ADC codes (pp)'] = codes[2]
         info = {
             'Unit S/N': sn, 'Mode': mode, 'Front-panel setpoint (W)': setpoint,
-            'Load (ohm)': load, 'Pearson coil turns': turns,
+            'Load (ohm)': load, 'Pearson coil turns': turns, 'Voltage tap x': vmult,
             'Date': datetime.datetime.now().isoformat(timespec='seconds'),
             'Instrument': scope.query('*IDN?').strip(), 'Samples/ch': len(V), 'dt (s)': dt,
         }
@@ -301,7 +301,7 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
 def run(args):
     mets, _ = generate(args.resource, args.sn, args.mode, args.setpoint, args.load,
                        args.out, args.smooth, args.acq, args.count, args.turns,
-                       not args.no_autoscale, args.cycles)
+                       not args.no_autoscale, args.cycles, args.vmult)
     print("  P (Vrms^2/R) = %.1f W | P (Irms^2*R) = %.1f W | P (mean v*i) = %.1f W"
           % (mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'], mets['P_from_VxI (mean v*i)']))
 
@@ -332,7 +332,7 @@ def session(args):
             chans, dt = capture(scope, acq=args.acq, count=args.count)
             if 1 not in chans or 2 not in chans:
                 print("  !! need CH1 (voltage) + CH2 (current) enabled"); continue
-            V = chans[1] * PROBE_RATIO
+            V = chans[1] * PROBE_RATIO * args.vmult
             I = chans[2] / COIL_V_PER_A / args.turns
             fs = scope_meas(scope, 'FREQuency')
             fs = fs if fs and 1e3 < fs < 1e8 else None
@@ -367,7 +367,7 @@ def live(args):
             chans, dt = capture(scope, acq=args.acq, count=args.count)
             if 1 not in chans or 2 not in chans:
                 print("need CH1 (voltage) + CH2 (current) enabled"); break
-            V = chans[1] * PROBE_RATIO
+            V = chans[1] * PROBE_RATIO * args.vmult
             I = chans[2] / COIL_V_PER_A / args.turns
             t = np.arange(len(V)) * dt * 1e6
             fs = scope_meas(scope, 'FREQuency')
@@ -524,6 +524,9 @@ def demo():
         assert abs(m[key] - 20) < 0.1, (key, m[key])
     assert abs(m['Freq_Hz'] - 4000) < 20, m['Freq_Hz']
     assert abs(m['Vrms'] - 100) < 0.1
+    # --vmult scales V, so Vrms^2/R scales by vmult^2 (probe 1/3 the load -> vmult 3 -> 9x)
+    assert abs(metrics(V * 3, I, 500, t[1] - t[0])['P_from_V (Vrms^2/R)']
+               - 9 * metrics(V, I, 500, t[1] - t[0])['P_from_V (Vrms^2/R)']) < 1e-6
     # _snap125 must round UP to the next 1-2-5 gear so the chosen range never clips the signal
     assert _snap125(0.1, 1e-3, 1e5) == 0.1 and _snap125(0.11, 1e-3, 1e5) == 0.2
     assert _snap125(3, 1e-3, 1e5) == 5 and _snap125(0.03, 1e-3, 1e5) == 0.05
@@ -552,6 +555,7 @@ if __name__ == '__main__':
     ap.add_argument('--setpoint', default='?', help='front-panel watts')
     ap.add_argument('--load', type=float, default=500, help='load resistance (ohm)')
     ap.add_argument('--turns', type=int, default=1, help='passes of the ESU wire through the Pearson coil (N turns = Nx signal, amps divided back by N)')
+    ap.add_argument('--vmult', type=float, default=1.0, help='voltage tap multiplier = load-divider ratio when the probe is across only PART of the load (e.g. 3 when probing 1 of 3 equal series resistors). Corrects V so all 3 power methods agree.')
     ap.add_argument('--no-autoscale', action='store_true', help='skip auto V/div + timebase; use the scope as-is')
     ap.add_argument('--cycles', type=int, default=6, help='approx # of waveform cycles to show on screen (autoscale timebase)')
     ap.add_argument('--smooth', type=int, default=0, help='display-only current smoothing window (samples); 0=off')
