@@ -59,6 +59,11 @@ def autoscale(scope, targets=(1, 2), cycles=6):
     Per channel: measure peak, set V/div so peak sits at ~3 of 8 divisions (6-div span,
     headroom left). Then set the timebase from CH1's frequency to show ~`cycles` cycles."""
     import numpy as np, time
+    # ponytail: ESU carriers are 0.3-4 MHz. Start fast so dom_freq can't lock onto an alias --
+    # at a slow timebase the scope drops to ~125 kSa/s, dom_freq returns the beat (e.g. 309 Hz),
+    # and we'd set an even slower timebase from it. That loop latches and never recovers.
+    scope.write(':TIMebase:SCALe 1e-6')              # 14 us window: ~56 cyc @4 MHz, ~4 cyc @300 kHz
+    time.sleep(0.2)
     chans, dt = capture(scope)                       # quick read under HRES + BWLimit
     for ch in targets:
         if ch not in chans:
@@ -70,8 +75,12 @@ def autoscale(scope, targets=(1, 2), cycles=6):
     if 1 in chans:
         f = dom_freq(chans[1], dt)
         if f and np.isfinite(f):
+            if not 1e5 <= f <= 1e7:                  # outside any ESU band -> we're seeing an alias
+                print(f"  WARNING: measured {f:,.0f} Hz -- not an ESU carrier (0.3-4 MHz). "
+                      "Aliased or no RF present; power numbers will be wrong.")
             # nearest gear so the on-screen cycle count actually lands near `cycles`
-            scope.write(f':TIMebase:SCALe {_snap125((cycles / f) / HDIV, 2e-9, 50, up=False):g}')
+            # hi=2e-5 caps at 20 us/div -- keeps the sample rate above the carrier no matter what f says
+            scope.write(f':TIMebase:SCALe {_snap125((cycles / f) / HDIV, 2e-9, 2e-5, up=False):g}')
     time.sleep(0.3)                                  # let the new gears settle before the real capture
 
 
@@ -220,6 +229,10 @@ def metrics(V, I, R, dt, freq=None):
         'P_from_V (Vrms^2/R)': Vrms**2 / R,
         'P_from_I (Irms^2*R)': Irms**2 * R,
         'P_from_VxI (mean v*i)': float(np.mean(V * I)),
+        # |phase| between V and I via power factor. Magnitude only -- read lead/lag off the scope.
+        # Should be ~0 on a resistive load; a big angle means reactance (stray C) is in the I path.
+        'Phase_deg': float(np.degrees(np.arccos(
+            np.clip(np.mean(V * I) / (Vrms * Irms), -1, 1)))) if Vrms and Irms else float('nan'),
     }
 
 
@@ -302,8 +315,13 @@ def run(args):
     mets, _ = generate(args.resource, args.sn, args.mode, args.setpoint, args.load,
                        args.out, args.smooth, args.acq, args.count, args.turns,
                        not args.no_autoscale, args.cycles, args.vmult)
-    print("  P (Vrms^2/R) = %.1f W | P (Irms^2*R) = %.1f W | P (mean v*i) = %.1f W"
-          % (mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'], mets['P_from_VxI (mean v*i)']))
+    print("  P (Vrms^2/R) = %.1f W | P (Irms^2*R) = %.1f W | P (mean v*i) = %.1f W  [phase %.0f deg]"
+          % (mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'],
+             mets['P_from_VxI (mean v*i)'], mets['Phase_deg']))
+    if mets['P_from_VxI (mean v*i)'] < 0:
+        # A passive load cannot source power. Only a polarity error can do this.
+        print("  WARNING: real power is NEGATIVE -- a passive load cannot source power, so one "
+              "probe is backwards. Flip the voltage probe or the current coil and re-run.")
 
 
 def session(args):
@@ -337,9 +355,9 @@ def session(args):
             fs = scope_meas(scope, 'FREQuency')
             fs = fs if fs and 1e3 < fs < 1e8 else None
             m = metrics(V, I, args.load, dt, freq=fs)
-            print("  P: Vrms2/R=%.1f  Irms2*R=%.1f  v*i=%.1f W  |  Vrms=%.1f Irms=%.3f f=%.0fHz" % (
+            print("  P: Vrms2/R=%.1f  Irms2*R=%.1f  v*i=%.1f W  |  Vrms=%.1f Irms=%.3f f=%.0fHz ph=%.0fdeg" % (
                 m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)'], m['P_from_VxI (mean v*i)'],
-                m['Vrms'], m['Irms'], m['Freq_Hz']))
+                m['Vrms'], m['Irms'], m['Freq_Hz'], m['Phase_deg']))
             w.writerow([s, m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)'],
                         m['P_from_VxI (mean v*i)'], m['Vrms'], m['Irms'], m['Freq_Hz']])
             f.flush()
