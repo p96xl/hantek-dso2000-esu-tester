@@ -24,3 +24,7 @@ build_log.txt
 *.jpg
 *.jpeg
 Screenshot*.png
+
+# bench output from --watch (rows carry per-unit measurements)
+*_bursts.csv
+*_bursts.csv.old

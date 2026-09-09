@@ -31,7 +31,12 @@ os.environ['PATH'] = _dll_dir + os.pathsep + os.environ.get('PATH', '')
 PROBE_RATIO = 1.0      # leave at 1 — the scope's own probe setting handles CH1 voltage scaling
 # Current is unavoidable in software: the Pearson is 0.1 V/A and the scope only shows volts.
 COIL_V_PER_A = 0.1     # Pearson 110A: 0.1 (1 MO input) or 0.05 (50 O input). Amps = CH2_volts / this. CH2 probe = 1x.
-CODES_PER_DIV = 25.0   # ponytail: DSO2000 ADC = 25 codes/div (from ref impl). VERIFY via --calcheck.
+CODES_PER_DIV = 25.0   # DSO2000 ADC = 25 codes/div. VERIFIED on our DSO2C50 fw 1.0.8 (2026-09-09)
+                       # by stepping :CHANnel1:OFFSet one division at a time: +25,+25,+26,-24,-25 codes.
+ADC_RAIL = 127         # signed-int8 saturation. MEASURED, and it is NOT the screen edge: the ADC rails
+                       # at +/-128 codes = +/-5.12 divisions, while the screen is 8 div (+/-100 codes).
+                       # So a trace drawn clipped at the top of the screen still carries VALID data out
+                       # to 1.28x the screen edge; only past +/-127 does it truly saturate and read low.
 # ---------------------------------------------------------------------------
 
 BLOCK = 2000           # samples are interleaved in 2000-byte per-channel blocks
@@ -53,25 +58,83 @@ def _snap125(x, lo, hi, up=True):
     return min(max(pick, lo), hi)
 
 
-def autoscale(scope, targets=(1, 2), cycles=6, set_timebase=True):
-    """Fill the ADC so a small signal stops reading as noise.
-    The #1 cause of a 'noisy' trace here is a signal spanning only a few ADC codes.
-    Per channel: measure peak, set V/div so peak sits at ~3 of 8 divisions (6-div span,
-    headroom left). Then set the timebase from CH1's frequency to show ~`cycles` cycles."""
-    import numpy as np, time
-    # ponytail: ESU carriers are 0.3-4 MHz. Start fast so dom_freq can't lock onto an alias --
-    # at a slow timebase the scope drops to ~125 kSa/s, dom_freq returns the beat (e.g. 309 Hz),
-    # and we'd set an even slower timebase from it. That loop latches and never recovers.
-    scope.write(':TIMebase:SCALe 1e-6')              # 14 us window: ~56 cyc @4 MHz, ~4 cyc @300 kHz
-    time.sleep(0.2)
-    chans, dt = capture(scope)                       # quick read under HRES + BWLimit
+def clip_state(v, scale, offset):
+    """Where a channel's samples sit against the ADC rail, in raw codes.
+    Returns (peak_code, fraction_of_samples_at_the_rail). Undoes the volts conversion in
+    capture(): samp = (volts + offset)/scale*CODES_PER_DIV."""
+    import numpy as np
+    codes = np.abs((np.asarray(v, float) + offset) / scale * CODES_PER_DIV)
+    return float(codes.max()), float(np.mean(codes >= ADC_RAIL))
+
+
+def clip_warn(scope, chans, targets=(1, 2)):
+    """Print the clipping verdict per channel; return the set that is genuinely saturated.
+
+    Two DIFFERENT states get confused by eye, which is why this prints both:
+      * past the screen edge (>4 div) but under the rail -> looks clipped, reads CORRECTLY.
+        This is the one that causes needless re-reads.
+      * at the +/-127 rail -> flat-topped samples, Vrms and power read LOW. Real, silent error.
+    """
+    bad = set()
     for ch in targets:
         if ch not in chans:
             continue
-        pk = float(np.max(np.abs(chans[ch]))) or 1e-3
-        per_div = _snap125(pk / 3.0, 1e-3, 1e5)      # peak at ~3 div; snap up so it can't clip
-        scope.write(f':CHANnel{ch}:OFFSet 0')
-        scope.write(f':CHANnel{ch}:SCALe {per_div:g}')
+        scale = float(scope.query(f':CHANnel{ch}:SCALe?'))
+        offset = float(scope.query(f':CHANnel{ch}:OFFSet?'))
+        top, railed = clip_state(chans[ch], scale, offset)
+        if railed > 0.005:
+            bad.add(ch)
+            print(f"  !! CH{ch} SATURATED — {railed:.1%} of samples at the +/-{ADC_RAIL}-code ADC rail. "
+                  f"Vrms and power READ LOW. Raise CH{ch} V/div (now {scale:g} V/div).")
+        elif top > 4 * CODES_PER_DIV:
+            print(f"  (CH{ch} runs {top / (4 * CODES_PER_DIV):.2f}x past the SCREEN edge but is not "
+                  f"saturated — peak {top:.0f} of {ADC_RAIL} codes. This reading is VALID.)")
+    return bad
+
+
+def autoscale(scope, targets=(1, 2), cycles=6, set_timebase=True, passes=4):
+    """Fill the ADC so a small signal stops reading as noise.
+    The #1 cause of a 'noisy' trace here is a signal spanning only a few ADC codes.
+    Per channel: measure peak, set V/div so peak sits at ~3 of 8 divisions (6-div span,
+    headroom left). Then set the timebase from CH1's frequency to show ~`cycles` cycles.
+
+    ITERATES, because one pass cannot recover from a railed start: when the trace is already
+    clipped the measured peak IS the rail, so the true amplitude is unknown and all we can do
+    is step the range up and look again.
+
+    set_timebase=False now leaves the timebase completely alone. It used to force 1 us/div
+    regardless -- which is what broke envelope mode: V/div got chosen from a 14 us slice of an
+    ~8 ms envelope, the slice landed on the envelope flank, the peak read far too low, and the
+    real burst peaks then railed on the long window."""
+    import numpy as np, time
+    if set_timebase:
+        # ponytail: ESU carriers are 0.3-4 MHz. Start fast so dom_freq can't lock onto an alias --
+        # at a slow timebase the scope drops to ~125 kSa/s, dom_freq returns the beat (e.g. 309 Hz),
+        # and we'd set an even slower timebase from it. That loop latches and never recovers.
+        scope.write(':TIMebase:SCALe 1e-6')          # 14 us window: ~56 cyc @4 MHz, ~4 cyc @300 kHz
+        time.sleep(0.2)
+    chans, dt = capture(scope)                       # quick read under HRES + BWLimit
+    for _ in range(passes):
+        moved = False
+        for ch in targets:
+            if ch not in chans:
+                continue
+            scale = float(scope.query(f':CHANnel{ch}:SCALe?'))
+            offset = float(scope.query(f':CHANnel{ch}:OFFSet?'))
+            _, railed = clip_state(chans[ch], scale, offset)
+            if railed > 0.005:
+                per_div = _snap125(scale * 2.5, 1e-3, 1e5)   # railed: true peak unknown, step up and re-look
+            else:
+                pk = float(np.max(np.abs(chans[ch]))) or 1e-3
+                per_div = _snap125(pk / 3.0, 1e-3, 1e5)      # peak at ~3 div; snap up so it can't clip
+            if per_div != scale:
+                scope.write(f':CHANnel{ch}:OFFSet 0')
+                scope.write(f':CHANnel{ch}:SCALe {per_div:g}')
+                moved = True
+        if not moved:
+            break
+        time.sleep(0.3)
+        chans, dt = capture(scope)                   # re-look under the new range
     if set_timebase and 1 in chans:
         f = dom_freq(chans[1], dt)
         if f and np.isfinite(f):
@@ -206,9 +269,10 @@ def scope_meas(scope, item, ch=1):
     set :ITEM, or interleave :SYSTem:ERRor?; any of those desync the response buffer. VRMS is broken
     (returns the frequency) so only FREQuency/PERiod/VPP/VMAX/VAVG are usable. Occasional timeout -> None."""
     old = scope.timeout
+    src = 'MATH' if str(ch).upper() == 'MATH' else f'CHANnel{ch}'   # MATH is a source like a channel
     try:
         scope.timeout = 2000                    # short: a flaky query fails fast instead of hanging 15 s
-        return float(scope.query(f':MEASure:CHANnel{ch}:ITEM? {item}').strip())
+        return float(scope.query(f':MEASure:{src}:ITEM? {item}').strip())
     except Exception:
         return None
     finally:
@@ -309,6 +373,11 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
         chans, dt = capture(scope, acq=acq, count=count)
         if 1 not in chans or 2 not in chans:
             raise RuntimeError(f"Need CH1 (voltage) and CH2 (current) enabled; captured {sorted(chans)}")
+        railed = clip_warn(scope, chans)
+        if railed and auto:                     # one re-range + re-capture, then report honestly
+            autoscale(scope, cycles=cycles)
+            chans, dt = capture(scope, acq=acq, count=count)
+            railed = clip_warn(scope, chans)
         V = chans[1] * PROBE_RATIO * vmult     # real volts across load (vmult = load-tap ratio, e.g. 3 if probing 1 of 3 equal series Rs)
         I = chans[2] / COIL_V_PER_A / turns     # real amps: undo the coil V/A and the N turns
         fs = scope_meas(scope, 'FREQuency')     # scope's own counter (matches the display); None if it times out
@@ -323,6 +392,9 @@ def generate(resource, sn, mode, setpoint, load, out, smooth=0, acq='HRESolution
         if warn:
             print("  !! LOW RESOLUTION: " + warn)
         mets['CH2 ADC codes (pp)'] = codes[2]
+        if railed:
+            warn = (warn + "; " if warn else "") + \
+                   "SATURATED on " + ", ".join(f"CH{c}" for c in sorted(railed)) + " — power reads LOW"
         info = {
             'Unit S/N': sn, 'Mode': mode, 'Front-panel setpoint (W)': setpoint,
             'Load (ohm)': load, 'Pearson coil turns': turns, 'Voltage tap x': vmult,
@@ -383,7 +455,13 @@ def envelope_power(scope, args, repeats=3):
     # 1. FAST timebase: autoscale V/div (amplitude moves a lot across a sweep) and confirm a
     #    real carrier is present. Retry -- a fast window can land in a gap between bursts.
     carrier, mf = float('nan'), None
-    for attempt in range(6):
+    cached = getattr(args, '_carrier', None)
+    if cached and not args.recarrier:
+        # The carrier is a property of the MACHINE, not of the dial setting, so re-hunting it
+        # at every sweep point costs ~7 s to re-learn a number that cannot have changed.
+        carrier, mf = cached
+        print(f"  carrier {carrier:,.0f} Hz (cached — --recarrier to re-measure)")
+    for attempt in range(0 if cached and not args.recarrier else 6):
         scope.write(f':TIMebase:SCALe {_snap125(1e-6, 2e-9, 50, up=False):g}')
         time.sleep(0.2)
         if not args.no_autoscale:
@@ -398,7 +476,10 @@ def envelope_power(scope, args, repeats=3):
             break
         print(f"  (retry {attempt + 1}: fast window saw {mf['Freq_Hz']:,.0f} Hz -- between bursts)")
     else:
-        raise RuntimeError("never caught an in-burst carrier in 6 tries -- is the ESU keying?")
+        if not cached or args.recarrier:
+            raise RuntimeError("never caught an in-burst carrier in 6 tries -- is the ESU keying?")
+    if mf is not None:
+        args._carrier = (carrier, mf)
 
     # 2. LONG window. NORMal, never HRES -- HRES boxcar-averages the carrier to nothing.
     scope.write(f':TIMebase:SCALe {_snap125(args.envwin / HDIV, 2e-9, 50):g}')
@@ -408,23 +489,53 @@ def envelope_power(scope, args, repeats=3):
         raise RuntimeError(f"timebase did not take: asked {args.envwin / HDIV:g} s/div, scope is at "
                            f"{got:g} ({got * HDIV * 1e3:.1f} ms window). Set it by hand.")
 
-    ms = []
-    for _ in range(repeats):                    # repeats ARE the validation (coherent-sampling guard)
+    # V/div is chosen HERE, on the long window -- the only window that actually contains the
+    # envelope peaks. Scaling it on the fast window above picks the range from whatever point
+    # of the envelope that 14 us slice happened to land on, and a landing on the flank sets a
+    # range the real peaks then rail against. set_timebase=False keeps this long window.
+    # NOTE: no autoscale here on purpose. Ranging costs a capture (or four) BEFORE the real
+    # one; capturing first and re-ranging only when clip_warn actually fires costs nothing in
+    # the common case. The fast-window pass above has already set a sane V/div.
+
+    # ONE DEEP CAPTURE instead of `repeats` shallow ones. Measured on the DSO2C50: 4K memory
+    # gives an 80 ms record in 2.3 s, 40K gives 800 ms in 5.4 s -- the sample rate does NOT
+    # drop, the record just gets 10x longer. So one 40K frame holds ~96 envelope periods at
+    # 120 Hz where three 4K frames held ~10 between them: more data, in a third of the time.
+    # The agreement check that `repeats` provided now comes from THIRDS of the one record,
+    # which is the same statistic over a longer baseline (267 ms each vs 80 ms).
+    prev_depth = None
+    try:
+        prev_depth = scope.query(':ACQuire:POINts?').strip()
+    except Exception:
+        pass
+    if prev_depth and prev_depth != str(args.envdepth):
+        scope.write(f':ACQuire:POINts {int(args.envdepth)}')
+        time.sleep(0.6)
+    chans, dte = capture(scope, acq='NORMal', count=args.count)
+    if clip_warn(scope, chans):
+        print("  (re-ranging and re-capturing — a saturated frame reads low)")
+        autoscale(scope, cycles=args.cycles, set_timebase=False)
         chans, dte = capture(scope, acq='NORMal', count=args.count)
-        ms.append(metrics(chans[1] * PROBE_RATIO * args.vmult,
-                          chans[2] / COIL_V_PER_A / args.turns, args.load, dte))
-    Ps = np.array([x['P_from_VxI (mean v*i)'] for x in ms])
-    spread = float(Ps.std() / Ps.mean()) if Ps.mean() else float('nan')
-    m = dict(ms[0]); m['P_from_VxI (mean v*i)'] = float(Ps.mean()); m['Freq_Hz'] = carrier
-    print(f"  carrier {carrier:,.0f} Hz, {got * HDIV * 1e3:.0f} ms window | envelope: "
-          + " | ".join(f"{p:.1f}" for p in Ps) + f"  -> {Ps.mean():.1f} W (spread {100 * spread:.1f}%)")
+    if prev_depth and prev_depth != str(args.envdepth):
+        scope.write(f':ACQuire:POINts {prev_depth}')      # leave the scope as we found it
+
+    Vf = chans[1] * PROBE_RATIO * args.vmult
+    If = chans[2] / COIL_V_PER_A / args.turns
+    m = metrics(Vf, If, args.load, dte)
+    n3 = len(Vf) // 3                                     # thirds replace the 3 repeats
+    Ps = np.array([float(np.mean(Vf[i*n3:(i+1)*n3] * If[i*n3:(i+1)*n3])) for i in range(3)])
+    spread = float(Ps.std() / abs(Ps.mean())) if Ps.mean() else float('nan')
+    m['Freq_Hz'] = carrier
+    print(f"  carrier {carrier:,.0f} Hz, {len(Vf) * dte * 1e3:.0f} ms record ({len(Vf)} pts) | thirds: "
+          + " | ".join(f"{p:.1f}" for p in Ps) + f"  -> {m['P_from_VxI (mean v*i)']:.1f} W (spread {100 * spread:.1f}%)")
     if spread > 0.05:
-        print("  WARNING: repeats disagree >5% -- raise --envwin; this reading is not trustworthy")
+        print("  WARNING: the thirds of this record disagree >5% -- the window is still shorter "
+              "than the modulation period. Raise --envwin or --envdepth; this reading is not trustworthy")
     # Coherent sampling gives a STABLE wrong answer, so `spread` can't see it. The fast capture
     # resolves the carrier, so its Vpeak is the true peak; phase-uniform slow sampling over
     # thousands of samples must still land near it. Much lower = samples stuck at one phase.
     # (A low Vrms/Vpeak ratio does NOT work as the test -- modulated modes read low legitimately.)
-    hit = ms[-1]['Vpeak'] / mf['Vpeak'] if mf['Vpeak'] else float('nan')
+    hit = m['Vpeak'] / mf['Vpeak'] if mf['Vpeak'] else float('nan')
     if hit < 0.8:
         print(f"  WARNING: long-window Vpeak is only {hit:.0%} of the carrier-resolved Vpeak -- "
               "samples are missing the peaks (sample rate near a divisor of the carrier). "
@@ -658,6 +769,13 @@ def session(args):
                 chans, dt = capture(scope, acq=args.acq, count=args.count)
                 if 1 not in chans or 2 not in chans:
                     print("  !! need CH1 (voltage) + CH2 (current) enabled"); continue
+                # a sweep walks the dial UP, so the range set at the last setting rails at the
+                # next one. Re-range and re-capture instead of logging a low number.
+                if clip_warn(scope, chans) and not args.no_autoscale:
+                    print("  (re-ranging and re-capturing)")
+                    autoscale(scope, cycles=args.cycles)
+                    chans, dt = capture(scope, acq=args.acq, count=args.count)
+                    clip_warn(scope, chans)
                 fs = scope_meas(scope, 'FREQuency')
                 m = metrics(chans[1] * PROBE_RATIO * args.vmult,
                             chans[2] / COIL_V_PER_A / args.turns, args.load, dt,
@@ -678,6 +796,165 @@ def session(args):
             save()                          # rewrite after every capture -- a crash loses nothing
         print(f"Sweep saved -> {csvpath} ({len(rows)} row(s))")
     finally:
+        scope.close()
+
+
+def ref_bands(ref):
+    """Load a reference CSV as {mode: [(setting, lo_W, hi_W)]} — the inverse of the
+    expected/tol form, so a measured wattage can be mapped back to candidate dial settings."""
+    import csv, os, glob
+    refdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'refs')
+    if not os.path.exists(ref):
+        cand = os.path.join(refdir, ref if ref.endswith('.csv') else ref + '.csv')
+        if not os.path.exists(cand):
+            return {}
+        ref = cand
+    out = {}
+    with open(ref, newline='') as f:
+        for r in csv.DictReader(f):
+            e, t = float(r['expected_W']), float(r['tol_pct'])
+            out.setdefault(r['mode'].strip().lower(), []).append(
+                (float(r['setting']), e * (1 - t / 100), e * (1 + t / 100)))
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def identify(bands, mode, watts):
+    """Which dial settings could produce this reading? Returns (candidates, note).
+
+    Often the answer is NOT one setting. The OEM bands overlap heavily at the top of every
+    mode — on Dento CUT a reading of 55 W sits inside settings 5,6,7,8,9 and 10 at once, so
+    claiming a single setting there would be invention, not measurement."""
+    b = bands.get(str(mode).strip().lower())
+    if not b:
+        return None, f"no reference curve for mode '{mode}'"
+    hits = [int(s) for s, lo, hi in b if lo <= watts <= hi]
+    if not hits:
+        # Report the DISTANCE to the nearest band, not just "no match". A reading 0.05 W past
+        # a band edge is measurement scatter; one 20 W away is a real fault. Saying
+        # "out of spec" for both is how a good unit gets failed.
+        near = min(b, key=lambda x: min(abs(watts - x[1]), abs(watts - x[2])))
+        gap = min(abs(watts - near[1]), abs(watts - near[2]))
+        pct = 100 * gap / watts if watts else float('inf')
+        edge = f"setting {int(near[0])} ({near[1]:.1f}-{near[2]:.1f} W)"
+        if pct <= 5:
+            return [int(near[0])], (f"{watts:.1f} W is {gap:.2f} W ({pct:.1f}%) outside {edge} — "
+                                    "within measurement scatter, read it as that setting")
+        return [], (f"{watts:.1f} W matches NO setting; nearest is {edge}, {gap:.1f} W ({pct:.0f}%) away. "
+                    "Check the load and --turns before calling the unit faulty.")
+    if len(hits) == 1:
+        return hits, f"unambiguous — setting {hits[0]}"
+    return hits, f"AMBIGUOUS — {watts:.1f} W is inside settings {hits}; the OEM bands overlap here"
+
+
+def watch(args):
+    """Fire-detect: wait for the ESU to key, capture on its own, log, re-arm.
+
+    Removes the countdown -- nobody has to time a burst against a capture. The detector is
+    the CURRENT channel, because it is the only one that is genuinely quiet between bursts:
+    measured idle it sits at exactly one ADC code (2 mV at 50 mV/div) with zero scatter,
+    while the voltage channel carries several volts of pickup. Current only flows when the
+    ESU is actually delivering into the load, so it cannot false-trigger on RF pickup.
+
+    Detection runs at ~1 Hz (a :MEASure query costs ~1 s on fw 1.0.8). That is ample for a
+    10 s burst, and the latency is a FEATURE: the scope free-runs in AUTO sweep, so the
+    frame is always current, and capturing ~1 s in skips the turn-on transient."""
+    import csv, os, time, numpy as np
+    scope = connect(args.resource)
+    restore = {}
+    try:
+        for k in (':TRIGger:SWEep?',):
+            try: restore[k] = scope.query(k).strip()
+            except Exception: pass
+        scope.write(':TRIGger:SWEep AUTO')       # free-run, so the frame is always fresh
+        if args.math:                            # opt-in diagnostic only — see below
+            scope.write(':MATH:OPERator MULTiply')
+            scope.write(':MATH:DISPlay ON')
+        ch = args.fire_ch
+        scale = float(scope.query(f':CHANnel{ch}:SCALe?'))
+
+        def level():
+            v = scope_meas(scope, 'VPP', ch)
+            return v if v is not None else 0.0
+
+        print(f"\nBaselining CH{ch} — DO NOT FIRE for ~8 s...")
+        base = [level() for _ in range(8)]
+        floor = max(base)
+        # 3 ADC codes above the quantisation floor: at 0.1 V/A that is ~0.06 A, ~2 W into
+        # 500 ohm, so even the manual's 5% smoke test trips it.
+        thr = args.fire_threshold or max(floor * 3, 3 * scale / CODES_PER_DIV)
+        print(f"  idle CH{ch} Vpp: min={min(base):.4g} max={floor:.4g} V")
+        print(f"  ARMED — fires when CH{ch} Vpp > {thr:.4g} V "
+              f"(~{thr / COIL_V_PER_A / args.turns:.3g} A, ~{(thr/COIL_V_PER_A/args.turns)**2*args.load:.1f} W into {args.load:g} ohm)")
+
+        bands = ref_bands(args.ref)
+        if bands:
+            print(f"  reference: {args.ref}  (modes: {', '.join(sorted(bands))})")
+        csvpath = (args.session_name or 'esu_watch') + '_bursts.csv'
+        HDR = ['t', 'mode', 'setting', 'load_ohm', 'P_Vrms2R', 'P_Irms2R', 'P_meanVI',
+               'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg', 'clipped', 'settings']
+        # An older log has the three dead scope columns. Appending rows of a different width
+        # would silently misalign it, so move it aside rather than corrupt real bench data.
+        if os.path.exists(csvpath):
+            with open(csvpath, newline='') as _f:
+                first = next(csv.reader(_f), [])
+            if first and first != HDR:
+                os.replace(csvpath, csvpath + '.old')
+                print(f"  NOTE: {csvpath} had the old column set — kept as {csvpath}.old")
+        new_file = not os.path.exists(csvpath)
+        fh = open(csvpath, 'a', newline=''); wr = csv.writer(fh)
+        if new_file: wr.writerow(HDR); fh.flush()
+        print(f"  logging to {csvpath}   (Ctrl-C to stop)\n")
+
+        n = 0
+        while True:
+            if level() <= thr:
+                continue
+            n += 1
+            print(f"--- BURST {n} detected --- capturing (keep it keyed ~5 s)")
+            chans, dt = capture(scope, acq='NORMal', count=args.count)
+            railed = clip_warn(scope, chans)
+            V = chans[1] * PROBE_RATIO * args.vmult
+            I = chans[2] / COIL_V_PER_A / args.turns
+            m = metrics(V, I, args.load, dt)
+            # ponytail: the scope's own VRMS/FREQ/MATH reads used to live here and are GONE.
+            # Each costs ~1 s of a 10 s burst and all three were proven worthless on live RF
+            # 2026-09-09: VRMS returns a frequency (one burst gave VRMS == FREQ exactly), FREQ
+            # is an alias at any envelope timebase, and MATH VAVG read 0.000e+00 through four
+            # real bursts. --math still forces the MATH read for anyone re-testing that claim.
+            sm = scope_meas(scope, 'VAVG', 'MATH') if args.math else None
+            print(f"  P: Vrms2/R={m['P_from_V (Vrms^2/R)']:.1f}  Irms2*R={m['P_from_I (Irms^2*R)']:.1f}"
+                  f"  v*i={m['P_from_VxI (mean v*i)']:.1f} W   Vrms={m['Vrms']:.1f} Irms={m['Irms']:.3f}"
+                  f" f={m['Freq_Hz']:,.0f}Hz ph={m['Phase_deg']:.0f}deg")
+            if args.math:
+                print(f"  scope MATH VAVG={sm}  (diagnostic; proven dead on fw 1.0.8)")
+            hits = None
+            if bands:
+                # grade on mean(v*i): it assumes neither the typed load nor a resistive one
+                hits, note = identify(bands, args.mode, m['P_from_VxI (mean v*i)'])
+                print(f"  setting: {note}")
+            warn_modulated(m)
+            wr.writerow([time.strftime('%H:%M:%S'), args.mode, args.setpoint, args.load,
+                         m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)'],
+                         m['P_from_VxI (mean v*i)'], m['Vrms'], m['Irms'], m['Freq_Hz'],
+                         m['Phase_deg'], bool(railed),
+                         ' '.join(map(str, hits)) if hits else '']); fh.flush()
+            if railed:
+                print("  !! that burst was SATURATED — re-ranging now, fire again for a valid number")
+                autoscale(scope, cycles=args.cycles)
+            print("  release the pedal to re-arm...")
+            while level() > thr * 0.5:
+                pass
+            print("  ARMED\n")
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    finally:
+        try: fh.close()
+        except Exception: pass
+        for k, v in restore.items():
+            try: scope.write(k[:-1] + ' ' + v)
+            except Exception: pass
         scope.close()
 
 
@@ -859,6 +1136,34 @@ def demo():
     # --vmult scales V, so Vrms^2/R scales by vmult^2 (probe 1/3 the load -> vmult 3 -> 9x)
     assert abs(metrics(V * 3, I, 500, t[1] - t[0])['P_from_V (Vrms^2/R)']
                - 9 * metrics(V, I, 500, t[1] - t[0])['P_from_V (Vrms^2/R)']) < 1e-6
+    # clip_state: a clean sine must NOT read as railed; a flat-topped one must.
+    # 1 V/div, offset 0 -> the ADC rails at ADC_RAIL/CODES_PER_DIV = 5.08 V.
+    clean = 4.0 * np.sin(2 * np.pi * 4000 * t)                    # peak 100 codes = the screen edge
+    top, railed = clip_state(clean, 1.0, 0.0)
+    assert railed == 0.0 and abs(top - 100) < 1, (top, railed)
+    over = 5.0 * np.sin(2 * np.pi * 4000 * t)                     # past the screen, still under the rail
+    top, railed = clip_state(over, 1.0, 0.0)
+    assert railed == 0.0 and top > 4 * CODES_PER_DIV, (top, railed)   # valid data, only LOOKS clipped
+    sat = np.clip(8.0 * np.sin(2 * np.pi * 4000 * t), -5.08, 5.08)    # genuinely flat-topped
+    top, railed = clip_state(sat, 1.0, 0.0)
+    assert railed > 0.3, railed
+    # and the failure this exists to catch: a saturated capture under-reports power
+    assert np.sqrt(np.mean(sat**2)) < 0.95 * np.sqrt(np.mean((8.0 * np.sin(2 * np.pi * 4000 * t))**2))
+    # identify(): the OEM bands overlap, so a reading often maps to SEVERAL settings.
+    B = {'fulg': [(0,0,4),(1,0,4),(2,6,8),(3,7,11),(4,17,25),(5,21,31),(6,25,37)]}
+    assert identify(B, 'fulg', 18.34)[0] == [4]              # unambiguous
+    assert identify(B, 'fulg', 28.62)[0] == [5, 6]           # overlap -- must NOT claim one
+    assert identify(B, 'fulg', 10.84)[0] == [3]
+    # 11.05 W is 0.05 W past setting 3's edge -- scatter, NOT a fault. Must not fail a good unit.
+    assert identify(B, 'fulg', 11.05)[0] == [3] and 'scatter' in identify(B, 'fulg', 11.05)[1]
+    assert identify(B, 'fulg', 99.0)[0] == [] and 'NO setting' in identify(B, 'fulg', 99.0)[1]
+    assert identify(B, 'fulg', 14.0)[0] == []                # a real 3 W gap stays unmatched
+    assert identify(B, 'cut', 10)[0] is None                 # mode absent from this table
+    # a band round-trips exactly through the expected_W/tol_pct form the ref CSV stores
+    b_lo, b_hi = 17, 25                       # named so they cannot shadow the demo's t/V/I
+    b_exp = (b_lo + b_hi) / 2
+    b_tol = 100.0 * (b_hi - b_lo) / (b_hi + b_lo)
+    assert abs(b_exp * (1 - b_tol/100) - b_lo) < 1e-9 and abs(b_exp * (1 + b_tol/100) - b_hi) < 1e-9
     # _snap125 must round UP to the next 1-2-5 gear so the chosen range never clips the signal
     assert _snap125(0.1, 1e-3, 1e5) == 0.1 and _snap125(0.11, 1e-3, 1e5) == 0.2
     assert _snap125(3, 1e-3, 1e5) == 5 and _snap125(0.03, 1e-3, 1e5) == 0.05
@@ -898,12 +1203,33 @@ def demo():
         Im = Vm / R + Cs * np.gradient(Vm, dtc)
         dec = int(round((1 / 50e3) / dtc))            # slow window -> ~50 kSa/s, carrier aliased
         assert abs(np.mean(Vm[::dec] * Im[::dec]) / np.mean(Vm * Im) - 1) < 0.03
+    # thirds-of-one-record must reproduce what 3 separate captures reported, and a record
+    # SHORTER than the modulation period must still be flagged. This is the check that the
+    # envelope speed-up did not quietly trade accuracy for wall-clock.
+    # 3.9e6 / 50e3 = EXACTLY 78, which makes every sample land at the same carrier phase and
+    # the product average to zero -- the coherent-sampling trap this code warns about. Use a
+    # carrier that is not a whole multiple of the sample rate, as a real machine never is.
+    fenv, Rr, fcar = 120.0, 500.0, 3913700.0
+    tl = np.arange(0, 800e-3, 1 / 50e3)                    # 800 ms, what 40K memory gives
+    Vl = 300 * np.sqrt(2) * np.abs(np.sin(2 * np.pi * fenv * tl)) * np.sin(2 * np.pi * fcar * tl)
+    Il = Vl / Rr
+    n3 = len(Vl) // 3
+    thirds = np.array([np.mean(Vl[i*n3:(i+1)*n3] * Il[i*n3:(i+1)*n3]) for i in range(3)])
+    assert thirds.std() / thirds.mean() < 0.02, thirds     # long record -> thirds agree
+    assert abs(thirds.mean() / np.mean(Vl * Il) - 1) < 0.02
+    ts = tl[:len(tl)//100]                                 # 8 ms: SHORTER than one envelope period
+    Vs = 300 * np.sqrt(2) * np.abs(np.sin(2 * np.pi * fenv * ts)) * np.sin(2 * np.pi * fcar * ts)
+    Is = Vs / Rr
+    m3 = len(Vs) // 3
+    sh = np.array([np.mean(Vs[i*m3:(i+1)*m3] * Is[i*m3:(i+1)*m3]) for i in range(3)])
+    assert sh.std() / abs(sh.mean()) > 0.05, sh            # too-short window MUST trip the warning
     # and the failure the old peak-detect math produced on CW: exactly HALF
     Vm = 300 * np.sqrt(2) * np.sin(2 * np.pi * fc * tc); Im = Vm / R
     dec = int(round((1 / 50e3) / dtc))
     half = np.mean(np.abs(Vm[::dec]) * np.abs(Im[::dec])) / 2
     assert abs(half / np.mean(Vm * Im) - 0.5) < 0.02, half   # the 50% underread, reproduced
-    print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, snap125, session/verdict")
+    print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, "
+          "snap125, clip/rail detection, session/verdict")
 
 
 if __name__ == '__main__':
@@ -911,10 +1237,17 @@ if __name__ == '__main__':
     ap.add_argument('--gui', action='store_true', help='launch the tech GUI (also the default on double-click)')
     ap.add_argument('--session', nargs='*', metavar='NAME', help='power-sweep: connect+autoscale once, capture on each Enter, log to <NAME>_sweep.csv. Words are joined: --session ellman 1234 cut -> ellman_1234_cut_sweep.csv')
     ap.add_argument('--envelope', action='store_true', help='measure a MODULATED mode (blend/coag/fulg) via peak-detect envelope averaging; run on cut first to validate')
+    ap.add_argument('--envdepth', type=int, default=40000, help='memory depth for envelope captures. 40000 = an 800 ms record in ~5.4 s (vs 4000 = 80 ms in 2.3 s); 40000 is the 2-channel ceiling on this scope')
+    ap.add_argument('--recarrier', action='store_true', help='re-measure the carrier at every envelope point instead of reusing the first (the carrier is a property of the machine, not the dial setting)')
     ap.add_argument('--envwin', type=float, default=50e-3, metavar='SEC', help='envelope averaging window in seconds (default 0.05 = 3 cycles of a 60 Hz envelope)')
     ap.add_argument('--compare', metavar='SWEEP.CSV', help='score a saved session against --ref and chart it (no scope needed)')
     ap.add_argument('--ref', default='ellman-surgitron-4.0', metavar='MACHINE', help='OEM reference table: a name resolved in refs/<name>.csv, or an explicit path. Columns: model,mode,setting,load_ohm,expected_W,tol_pct')
     ap.add_argument('--live', action='store_true', help='rolling live waveform window (poll+redraw; close window to stop)')
+    ap.add_argument('--watch', action='store_true', help='FIRE-DETECT: wait for the ESU to key, capture automatically, log each burst, re-arm. No countdown needed.')
+    ap.add_argument('--fire-ch', type=int, default=2, help='channel the fire-detector watches (default 2 = the Pearson current channel, the only quiet one)')
+    ap.add_argument('--fire-threshold', type=float, default=0.0, help='detector threshold in raw channel volts; 0 = auto from the measured idle floor')
+    ap.add_argument('--session-name', metavar='NAME', help='--watch: log to <NAME>_bursts.csv (default esu_watch_bursts.csv)')
+    ap.add_argument('--math', action='store_true', help='--watch: re-test the scope MATH VAVG read (on-scope v*i). PROVEN DEAD on fw 1.0.8 and costs ~1 s per burst — diagnostic only, leave it off')
     ap.add_argument('--demo', action='store_true', help='run self-test, no scope')
     ap.add_argument('--list', action='store_true', help='list VISA resources + IDN')
     ap.add_argument('--calcheck', action='store_true', help='capture + print Vpp to verify scaling')
@@ -937,6 +1270,7 @@ if __name__ == '__main__':
     elif a.compare: compare(a)
     elif a.envelope: envelope(a)
     elif a.session is not None: session(a)   # [] when --session given bare -> still a session
+    elif a.watch: watch(a)
     elif a.live: live(a)
     elif a.demo: demo()
     elif a.list: list_resources()

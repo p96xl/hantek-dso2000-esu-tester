@@ -75,6 +75,7 @@ python esu_test.py --sn ELLMAN123 --mode "cut 50W" --load 500 --setpoint 50 --tu
 | `--session` | **Power-sweep mode** — connect + autoscale **once**, then capture on each Enter with the scope held open. Logs to `<name>_sweep.csv`. Use this for a full sweep instead of one slow process per setpoint. See [Sessions](#sessions--sweeping-a-machine) | `python esu_test.py --session ellman 1234 cut --load 500` |
 | `--envelope` | **Measure a modulated mode** (blend/coag/fulg) by peak-detect envelope averaging. Run on `cut` first to validate. See [Modulated modes](#modulated-modes-blend--coag--fulg--read-this-before-trusting-a-number) | `python esu_test.py --envelope --mode cutcoag --load 500` |
 | `--compare` | **Score a saved sweep against an OEM spec table** and chart it. No scope needed. See [Comparing against OEM spec](#comparing-against-oem-spec---compare) | `python esu_test.py --compare ellman_1234_cut_sweep.csv` |
+| `--watch` | **Fire-detect** — waits for the ESU to key, captures on its own, logs each burst, re-arms. No counting down against a capture. Watches the *current* channel (the only quiet one) and auto-thresholds ~3 ADC codes above the measured idle floor (~2 W into 500 Ω). Names the candidate dial settings if a `--ref` table is loaded | `python esu_test.py --watch --load 500 --turns 3 --mode fulg --ref ellman-dento-surg-90-ffp` |
 | `--live` | **Live waveform window** — poll + redraw until you close it. Not true streaming (the DSO2000 has no streaming SCPI, only whole-frame reads → ~1–3 Hz), but enough to watch the wave change as you turn the dial | `python esu_test.py --live --load 200 --turns 3` |
 | `--demo` | Self-test the math, no scope needed | `python esu_test.py --demo` |
 | `--list` | List VISA resources + `*IDN?` | `python esu_test.py --list` |
@@ -259,6 +260,14 @@ python esu_test.py --envelope --mode cutcoag --load 500 --turns 3
   P (mean v*i, long window) = 43.1 | 43.4 | 43.2  ->  43.2 W   (spread 0.3%)
 ```
 
+**Speed.** One deep capture replaces the three shallow ones this used to take, the carrier is
+measured once per machine rather than once per setpoint, and V/div is re-ranged only when
+clipping is actually detected instead of before every reading. Measured on a DSO2C50:
+`autoscale` alone costs **12.8 s** and used to run twice per reading. Net **~34 s → ~5.5 s per
+sweep point** (the first point still pays ~20 s for the carrier hunt), on 3.3× more envelope
+data — 800 ms of record instead of 3 × 80 ms. `--envdepth` sets the depth, `--recarrier` forces
+the carrier to be re-measured.
+
 Accuracy vs known truth (simulated at 50 and 125 kSa/s, with a 3,999,533 Hz carrier and 13° stray C):
 
 | Mode | Envelope | Error |
@@ -329,10 +338,24 @@ each target PC still needs the one-time driver step above.
 
 - **Firmware flashing is not needed** — this uses the stock DSO2000 SCPI.
 - HRES/averaging need a **repetitive** signal (steady cut/coag). For a **one-shot burst**, use `--acq NORMal`.
-- Deep memory is slow over USB (minutes at millions of points) — keep memory depth modest.
+- Memory depth is `:ACQuire:POINts` and it is **settable** (4K/40K/400K/4M/8M). **40K is the
+  sweet spot and the 2-channel ceiling**: 5.5 s for an 800 ms record, against 2.1 s for 80 ms
+  at 4K — the sample rate does not drop, the record just gets 10× longer, which is exactly
+  what a modulated mode needs. Millions of points really are minutes over USB; `--envdepth`
+  defaults to 40000. (`400000` silently reads back as `40000` in 2-channel mode.)
 - Power `mean(v·i)` is noise-immune; `Irms²·R` is not — if they disagree, suspect load drift or reactance.
 - The vendor SCPI manual (`DSO2000 Series SCPI Programmers Manual.pdf`) is on
   [hantek.com](https://www.hantek.com/) → product downloads. Not redistributed here.
+- **What the firmware actually supports** — which SCPI commands work, which answer with a
+  wrong number, and which are dead — is documented in
+  [`refs/dso2c50-scpi-commands.md`](refs/dso2c50-scpi-commands.md), probed against a real
+  DSO2C50 on fw 1.0.8 (94 of 101 commands respond). Read it before adding any SCPI.
+- ⚠ **Never read `:MEASure:…:ITEM? VRMS`** — on fw 1.0.8 it returns a *frequency*, not volts.
+  Compute Vrms from the trace. Likewise there is **no on-scope V·I**: `:MATH` multiply engages
+  but the MATH trace is never exported and `:MEASure:MATH:ITEM?` reads zero on live signal.
+- **Linux/WSL works** — the scope is USBTMC over libusb, no `usbtmc` kernel module needed. See
+  the same reference for the udev rule, the `usbipd` steps, and the USBTMC recovery sequence
+  (clear the halt on **Bulk-IN**, not Bulk-OUT).
 
 ## License
 MIT — see [LICENSE](LICENSE).
