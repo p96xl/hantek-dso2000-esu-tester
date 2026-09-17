@@ -809,6 +809,44 @@ def verdict(got, expected, tol_pct):
     return lo <= got <= hi, lo, hi, dev
 
 
+# (marker, filled, spec line style) per mode — shape + fill + dash tell modes apart on a
+# black-and-white printout; colour is only a bonus. Cycles past 8 modes.
+MODE_STYLE = [('o', True, '-'), ('^', True, '--'), ('s', True, ':'), ('s', False, '-.'),
+              ('D', True, '-'), ('o', False, '--'), ('^', False, ':'), ('v', True, '-.')]
+
+
+def draw_vs_spec(ax, curves, rows):
+    """Spec curve + tolerance band + measured points per mode. Shared by --compare and the
+    wizard's PDF so the two reports can never disagree about what a pass looks like.
+    curves: {mode: [(setting, expected_W, tol_pct, load)]}  rows: [{mode, setting, got, ok}]"""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    handles = []
+    for i, mode in enumerate(sorted({r['mode'] for r in rows})):
+        c = f'C{i}'
+        mk, filled, ls = MODE_STYLE[i % len(MODE_STYLE)]
+        face = c if filled else 'white'
+        pts = curves[mode]
+        xs = [p[0] for p in pts]
+        ax.plot(xs, [p[1] for p in pts], ls=ls, color=c, lw=1.4)
+        ax.fill_between(xs, [p[1] * (1 - p[2] / 100) for p in pts],
+                        [p[1] * (1 + p[2] / 100) for p in pts], color=c, alpha=0.12, lw=0)
+        mine = [r for r in rows if r['mode'] == mode]
+        ax.scatter([r['setting'] for r in mine], [r['got'] for r in mine], marker=mk, s=70,
+                   facecolor=face, edgecolor='k', linewidths=1.1, zorder=5)
+        handles.append(Line2D([], [], color=c, ls=ls, marker=mk, ms=8, mfc=face, mec='k', label=mode))
+    bad = [r for r in rows if not r['ok']]
+    if bad:
+        ax.scatter([r['setting'] for r in bad], [r['got'] for r in bad], marker='x', s=180,
+                   color='k', linewidths=2, zorder=6)
+        handles.append(Line2D([], [], ls='', marker='x', ms=10, mew=2, color='k', label='FAIL'))
+    ax.set_xlabel('Digital setting'); ax.set_ylabel('Power (W)')
+    ax.grid(alpha=0.3)
+    if handles:
+        handles.append(Patch(facecolor='0.85', label='shaded = tolerance'))
+        ax.legend(handles=handles, fontsize=8)
+
+
 def compare(args):
     """Score a saved session against an OEM reference table and chart it.
 
@@ -826,7 +864,7 @@ def compare(args):
     import matplotlib.pyplot as plt
 
     # --ref takes a bare machine name (resolved in refs/) or an explicit path.
-    refdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'refs')
+    refdir = refs_dir()
     ref = args.ref
     if not os.path.exists(ref):
         cand = os.path.join(refdir, ref if ref.endswith('.csv') else ref + '.csv')
@@ -903,24 +941,8 @@ def compare(args):
     print(f"\n{npass}/{len(rows)} within tolerance")
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    for i, mode in enumerate(sorted({r['mode'] for r in rows})):
-        c = f'C{i}'
-        pts = curves[mode]
-        xs = [p[0] for p in pts]
-        ax.plot(xs, [p[1] for p in pts], '-', color=c, lw=1.2, label=f'{mode} spec')
-        ax.fill_between(xs, [p[1] * (1 - p[2] / 100) for p in pts],
-                        [p[1] * (1 + p[2] / 100) for p in pts], color=c, alpha=0.15,
-                        label=f'{mode} ±{pts[0][2]:.0f}%')
-        mine = [r for r in rows if r['mode'] == mode]
-        for ok, mark in ((True, 'o'), (False, 'X')):
-            sel = [r for r in mine if bool(r['ok']) == ok]
-            if sel:
-                ax.scatter([r['setting'] for r in sel], [r['got'] for r in sel], marker=mark,
-                           s=90, color=c, edgecolor='k', zorder=5,
-                           label=f'{mode} measured ({"pass" if ok else "FAIL"})')
-    ax.set_xlabel('Digital setting'); ax.set_ylabel('Power (W)')
+    draw_vs_spec(ax, curves, rows)
     ax.set_title(f'{os.path.basename(args.compare)} — measured vs OEM spec')
-    ax.grid(alpha=0.3); ax.legend(fontsize=8)
     out = args.compare.replace('.csv', '') + '_vs_spec.png'
     fig.tight_layout(); fig.savefig(out, dpi=130)
     print("Chart ->", out)
@@ -1039,14 +1061,30 @@ def app_dir():
                            else os.path.abspath(__file__))
 
 
-def refs_dirs():
-    """Writable refs dir first, the copy bundled into the exe second (read-only fallback,
-    so the shipped Ellman/Surgitron tables are there on a fresh machine)."""
-    out = [os.path.join(app_dir(), 'refs')]
-    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'refs')
-    if bundled not in out:
-        out.append(bundled)
-    return out
+def refs_dir():
+    """Where the CLI resolves a bare --ref name. The wizard never looks here — it opens and
+    saves profiles through a file dialog, so they can live anywhere (a shared drive)."""
+    return os.path.join(app_dir(), 'refs')
+
+
+def prefs(**upd):
+    """Last-used folders, per Windows user (~/.esu_test.json) — so it works whatever folder
+    the exe was copied to, including a read-only one. Pass keys to update."""
+    import json
+    p = os.path.join(os.path.expanduser('~'), '.esu_test.json')
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if upd:
+        d.update(upd)
+        try:
+            with open(p, 'w') as f:
+                json.dump(d, f)
+        except OSError:
+            pass            # losing a remembered folder is not worth an error dialog
+    return d
 
 
 def band_from(style, a, b):
@@ -1071,29 +1109,14 @@ def profile_slug(name):
     return re.sub(r'[^a-z0-9]+', '-', str(name).lower()).strip('-') or 'machine'
 
 
-def list_profiles():
-    import glob
-    seen = []
-    for d in refs_dirs():
-        for p in sorted(glob.glob(os.path.join(d, '*.csv'))):
-            n = os.path.splitext(os.path.basename(p))[0]
-            if n not in seen:
-                seen.append(n)
-    return seen
-
-
-def load_profile(name):
+def load_profile(path):
     """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct}, ...]) sorted mode then setting."""
     import csv
-    for d in refs_dirs():
-        p = os.path.join(d, profile_slug(name) + '.csv')
-        if os.path.exists(p):
-            break
-    else:
-        return '', []
     rows, model = [], ''
-    with open(p, newline='') as f:
+    with open(path, newline='') as f:
         for r in csv.DictReader(f):
+            if not (r.get('mode') or '').strip():
+                continue                 # Excel loves to leave trailing all-comma rows
             model = model or r.get('model', '')
             rows.append({'mode': r['mode'].strip().lower(), 'setting': float(r['setting']),
                          'load_ohm': float(r['load_ohm']), 'expected_W': float(r['expected_W']),
@@ -1102,17 +1125,27 @@ def load_profile(name):
     return model, rows
 
 
-def save_profile(name, model, rows):
+def save_profile(path, model, rows):
     import csv
-    d = refs_dirs()[0]
-    os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, profile_slug(name) + '.csv')
-    with open(p, 'w', newline='') as f:
+    with open(path, 'w', newline='') as f:
         w = csv.writer(f); w.writerow(PROF_HDR)
         for r in rows:
             w.writerow([model, r['mode'], g(r['setting']), g(r['load_ohm']),
                         g(r['expected_W']), g(r['tol_pct'])])
-    return p
+    return path
+
+
+def setting_range(lo, hi, step):
+    """Dial settings lo..hi every `step`, always ending ON hi — the top of the dial is a point
+    worth testing even when the step does not land on it (0-125 by 10 -> ..., 120, 125)."""
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    lo, hi = sorted((lo, hi))
+    n = int((hi - lo) / step + 1e-9)
+    out = [round(lo + k * step, 6) for k in range(n + 1)]
+    if hi - out[-1] > 1e-9:
+        out.append(hi)
+    return [float(x) for x in out]
 
 
 def g(x):
@@ -1126,14 +1159,14 @@ def ref_bands(ref):
     import csv
     if not os.path.exists(ref):
         name = ref if ref.endswith('.csv') else ref + '.csv'
-        for d in refs_dirs():
-            if os.path.exists(os.path.join(d, name)):
-                ref = os.path.join(d, name); break
-        else:
+        ref = os.path.join(refs_dir(), name)
+        if not os.path.exists(ref):
             return {}
     out = {}
     with open(ref, newline='') as f:
         for r in csv.DictReader(f):
+            if not (r.get('mode') or '').strip():
+                continue
             e, t = float(r['expected_W']), float(r['tol_pct'])
             out.setdefault(r['mode'].strip().lower(), []).append(
                 (float(r['setting']), e * (1 - t / 100), e * (1 + t / 100)))
@@ -1527,7 +1560,7 @@ def gui():
             out = f"esu_report_{sn}.html".replace(' ', '_')
             mets, path = generate(None, sn, ent['mode'].get(), ent['setpoint'].get(),
                                   float(ent['load'].get()), out, int(ent['smooth'].get() or 0),
-                                  turns=int(ent['turns'].get() or 1))
+                                  turns=int(ent['turns'].get() or 3))
             status.set("P: Vrms²/R=%.1fW · Irms²·R=%.1fW · v·i=%.1fW · freq=%.0fHz" % (
                 mets['P_from_V (Vrms^2/R)'], mets['P_from_I (Irms^2*R)'],
                 mets['P_from_VxI (mean v*i)'], mets['Freq_Hz']))
@@ -1543,6 +1576,85 @@ def gui():
     tk.Label(root, textvariable=status, wraplength=420, justify="left",
              fg="#036").grid(row=r + 1, column=0, columnspan=2, padx=8, pady=8)
     root.mainloop()
+
+
+def results_pdf(path, sn, model, rows, meas):
+    """Wizard results -> PDF: the graded table, then the measured-vs-spec chart (same drawing
+    as --compare) on the same page when it fits. rows = profile rows,
+    meas = {row index: metrics}. -> (npass, ngraded)"""
+    import datetime, matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.lines import Line2D
+    curves, graded, lines = {}, [], []
+    for r in rows:
+        if r['expected_W']:
+            curves.setdefault(r['mode'], []).append(
+                (r['setting'], r['expected_W'], r['tol_pct'], r['load_ohm']))
+    for i in sorted(meas):
+        r, m = rows[i], meas[i]
+        got = m['P_from_VxI (mean v*i)']
+        lo, hi = band_to('minmax', r['expected_W'], r['tol_pct'])
+        if r['expected_W']:
+            ok, _, _, dev = verdict(got, r['expected_W'], r['tol_pct'])
+            graded.append(dict(mode=r['mode'], setting=r['setting'], got=got, ok=ok))
+            vd = f"{'PASS' if ok else 'FAIL'} {dev:+.1f}%"
+        else:
+            vd = 'no spec'
+        lines.append((r['mode'], f"{r['mode']:<9}{g(r['setting']):>4}  {lo:>6.4g} - {hi:<6.4g}{g(r['load_ohm']):>5}"
+                     f"{got:>8.1f}  {vd:<12}{m['Vrms']:>7.1f}{m['Irms']:>7.3f}{m['Freq_Hz'] / 1e3:>7.0f}"
+                     f"{m['Phase_deg']:>6.1f}"))
+    cols = (f"{'mode':<9}{'set':>4}  {'spec W':<15}{'load':>5}{'meas W':>8}  "
+            f"{'result':<12}{'Vrms':>7}{'Irms':>7}{'kHz':>7}{'phase':>6}")
+    npass = sum(x['ok'] for x in graded)
+    missing = len(rows) - len(meas)
+
+    # All layout in inches from the top of a Letter page.
+    W, H, M = 8.5, 11.0, 0.6            # page, margin
+    ROW, GAP, CHART = 0.23, 0.14, 4.4   # row pitch, extra gap between modes, chart plot height
+    pages = []
+
+    def new_page():
+        pages.append(plt.figure(figsize=(W, H)))
+        return M
+
+    def text(y, s, **kw):
+        pages[-1].text(M / W, 1 - y / H, s, family='monospace', va='top', **kw)
+
+    def rule(y, **kw):
+        pages[-1].add_artist(Line2D([M / W, 1 - M / W], [1 - y / H] * 2, **kw))
+
+    y = new_page()
+    pages[-1].text(M / W, 1 - y / H, f"ESU output test — {model}", fontsize=15, weight='bold', va='top')
+    y += 0.34
+    text(y, f"S/N {sn}    {datetime.datetime.now():%Y-%m-%d %H:%M}", fontsize=10); y += 0.24
+    text(y, f"{npass}/{len(graded)} within tolerance"
+         + (f"    ({missing} profile point(s) not measured)" if missing else ""), fontsize=10, weight='bold')
+    y += 0.42
+    prev = None
+    for mode, ln in lines:
+        if y + ROW + GAP > H - M:
+            y, prev = new_page(), None
+        if prev is None:                            # column header, repeated on every page
+            text(y, cols, fontsize=9, weight='bold'); y += ROW
+            rule(y - 0.05, color='k', lw=0.8); y += 0.04
+        elif mode != prev:
+            y += GAP
+            rule(y - GAP / 2 - 0.04, color='0.7', lw=0.6)
+        text(y, ln, fontsize=9); y += ROW
+        prev = mode
+    if graded:
+        # title + x-axis labels need ~1 in around the plot itself
+        if y + 0.5 + CHART + 0.6 > H - M:
+            y = new_page() - 0.3
+        ax = pages[-1].add_axes([0.9 / W, 1 - (y + 0.5 + CHART) / H, (W - 0.9 - M) / W, CHART / H])
+        draw_vs_spec(ax, curves, graded)
+        ax.set_title("Measured vs spec", fontsize=11, weight='bold')
+    with PdfPages(path) as pdf:
+        for fig in pages:
+            pdf.savefig(fig); plt.close(fig)
+    return npass, len(graded)
 
 
 class _QueueWriter:
@@ -1564,10 +1676,10 @@ def wizard():
 
     Stdlib tkinter/ttk only — no new dependency, ships inside the existing exe."""
     import tkinter as tk
-    from tkinter import ttk, messagebox
+    from tkinter import ttk, messagebox, filedialog
     import contextlib, csv, queue, threading, types
 
-    S = types.SimpleNamespace(rows=[], meas={}, cursor=None, stop=True, thread=None,
+    S = types.SimpleNamespace(rows=[], meas={}, cursor=None, stop=True, thread=None, path='',
                               q=queue.Queue(), style=None, force=False, reaim=False)
 
     root = tk.Tk(); root.title("ESU Calibration Wizard")
@@ -1579,10 +1691,9 @@ def wizard():
     pf = ttk.Frame(nb); nb.add(pf, text=' 1. Machine profile ')
 
     bar = ttk.Frame(pf); bar.pack(fill='x', padx=8, pady=(8, 2))
-    ttk.Label(bar, text="Machine").pack(side='left')
-    machine = ttk.Combobox(bar, values=list_profiles(), width=30); machine.pack(side='left', padx=6)
-    ttk.Label(bar, text="Model / label").pack(side='left', padx=(12, 4))
-    model = ttk.Entry(bar, width=30); model.pack(side='left')
+    ttk.Label(bar, text="Model / label").pack(side='left')
+    model = ttk.Entry(bar, width=30); model.pack(side='left', padx=(4, 0))
+    l_path = ttk.Label(bar, text="(new profile — not saved yet)", foreground='#666')
 
     sty = ttk.Frame(pf); sty.pack(fill='x', padx=8, pady=2)
     ttk.Label(sty, text="Spec is written as:").pack(side='left')
@@ -1601,6 +1712,8 @@ def wizard():
         mm = S.style.get() == 'minmax'
         ptv.heading('a', text='Min W' if mm else 'Nominal W')
         ptv.heading('b', text='Max W' if mm else '± %')
+        l_a.configure(text='Min W' if mm else 'Nominal W')
+        l_b.configure(text='Max W' if mm else '± %')
         for i, r in enumerate(S.rows):
             a, b = band_to(S.style.get(), r['expected_W'], r['tol_pct'])
             ptv.insert('', 'end', iid=str(i), values=(r['mode'], f"{g(r['setting'])}",
@@ -1620,48 +1733,52 @@ def wizard():
     e_lo = ttk.Entry(addf, width=5); e_lo.insert(0, '0'); e_lo.grid(row=0, column=3)
     ttk.Label(addf, text="to").grid(row=0, column=4, padx=2)
     e_hi = ttk.Entry(addf, width=5); e_hi.insert(0, '10'); e_hi.grid(row=0, column=5)
-    ttk.Label(addf, text="load Ω").grid(row=0, column=6, padx=(12, 2))
-    e_ld = ttk.Entry(addf, width=7); e_ld.insert(0, '500'); e_ld.grid(row=0, column=7)
+    ttk.Label(addf, text="step").grid(row=0, column=6, padx=(12, 2))
+    e_st = ttk.Entry(addf, width=5); e_st.insert(0, '1'); e_st.grid(row=0, column=7)
+    ttk.Label(addf, text="load Ω").grid(row=0, column=8, padx=(12, 2))
+    e_ld = ttk.Entry(addf, width=7); e_ld.insert(0, '500'); e_ld.grid(row=0, column=9)
 
     def add_mode():
         try:
-            lo, hi, ld = int(e_lo.get()), int(e_hi.get()), float(e_ld.get())
-        except ValueError:
-            return messagebox.showerror("Add mode", "settings and load must be numbers")
+            pts = setting_range(float(e_lo.get()), float(e_hi.get()), float(e_st.get() or 1))
+            ld = float(e_ld.get())
+        except ValueError as e:
+            return messagebox.showerror("Add mode", f"settings, step and load must be numbers\n{e}")
         name = e_mode.get().strip().lower()
         if not name:
             return messagebox.showerror("Add mode", "name the mode (cut, cutcoag, coag, fulg …)")
         have = {(r['mode'], r['setting']) for r in S.rows}
-        for s in range(lo, hi + 1):
-            if (name, float(s)) not in have:
-                S.rows.append({'mode': name, 'setting': float(s), 'load_ohm': ld,
+        for s in pts:
+            if (name, s) not in have:
+                S.rows.append({'mode': name, 'setting': s, 'load_ohm': ld,
                                'expected_W': 0.0, 'tol_pct': 0.0})
         S.rows.sort(key=lambda r: (r['mode'], r['setting']))
         prender()
 
-    ttk.Button(addf, text="Add", command=add_mode).grid(row=0, column=8, padx=10)
+    ttk.Button(addf, text="Add", command=add_mode).grid(row=0, column=10, padx=10)
 
-    setf = ttk.LabelFrame(pf, text="Set the spec for the selected row(s)")
+    setf = ttk.LabelFrame(pf, text="Set the spec for the selected row(s) — a blank field keeps that value")
     setf.pack(fill='x', padx=8, pady=(0, 8))
     l_a = ttk.Label(setf, text="Min W"); l_a.grid(row=0, column=0, padx=4, pady=6)
     e_a = ttk.Entry(setf, width=9); e_a.grid(row=0, column=1)
     l_b = ttk.Label(setf, text="Max W"); l_b.grid(row=0, column=2, padx=(12, 2))
     e_b = ttk.Entry(setf, width=9); e_b.grid(row=0, column=3)
-    ttk.Label(setf, text="load Ω (blank = keep)").grid(row=0, column=4, padx=(12, 2))
+    ttk.Label(setf, text="load Ω").grid(row=0, column=4, padx=(12, 2))
     e_l2 = ttk.Entry(setf, width=7); e_l2.grid(row=0, column=5)
 
     def apply_spec():
         sel = ptv.selection()
         if not sel:
             return messagebox.showinfo("Set spec", "select one or more rows first")
+        st, a_in, b_in, ld = S.style.get(), e_a.get().strip(), e_b.get().strip(), e_l2.get().strip()
         try:
-            exp, tol = band_from(S.style.get(), float(e_a.get()), float(e_b.get()))
+            [float(x) for x in (a_in, b_in, ld) if x]     # validate before touching any row
         except ValueError:
-            return messagebox.showerror("Set spec", "both values must be numbers")
-        ld = e_l2.get().strip()
+            return messagebox.showerror("Set spec", "values must be numbers")
         for iid in sel:
             r = S.rows[int(iid)]
-            r['expected_W'], r['tol_pct'] = exp, tol
+            a, b = band_to(st, r['expected_W'], r['tol_pct'])
+            r['expected_W'], r['tol_pct'] = band_from(st, a_in or a, b_in or b)
             if ld:
                 r['load_ohm'] = float(ld)
         prender()
@@ -1676,35 +1793,53 @@ def wizard():
 
     ttk.Button(setf, text="Delete selected", command=drop_rows).grid(row=0, column=7, padx=4)
 
+    def setpath(p):
+        S.path = p
+        l_path.configure(text=p)
+        prefs(profile_dir=os.path.dirname(p))
+
     def do_open():
-        name = machine.get().strip()
-        if not name:
-            return messagebox.showinfo("Open", "pick or type a machine name")
-        mdl, rows = load_profile(name)
+        p = filedialog.askopenfilename(parent=root, title="Open machine profile",
+                                       initialdir=prefs().get('profile_dir'),
+                                       filetypes=[("Machine profile", "*.csv"), ("All files", "*.*")])
+        if not p:
+            return
+        try:
+            mdl, rows = load_profile(p)
+        except (OSError, KeyError, ValueError) as e:
+            return messagebox.showerror("Open", f"not a machine profile:\n{p}\n\n{e}")
         if not rows:
-            return messagebox.showerror("Open", f"no saved profile for '{name}'")
+            return messagebox.showerror("Open", f"profile is empty:\n{p}")
         S.rows, S.meas, S.cursor = rows, {}, None
-        model.delete(0, 'end'); model.insert(0, mdl)
+        model.delete(0, 'end'); model.insert(0, mdl or os.path.splitext(os.path.basename(p))[0])
+        setpath(p)
         prender()
 
     def do_save():
-        name = machine.get().strip()
-        if not name:
-            return messagebox.showinfo("Save", "name the machine first")
         if not S.rows:
             return messagebox.showinfo("Save", "nothing to save")
-        p = save_profile(name, model.get().strip() or name, S.rows)
-        machine.configure(values=list_profiles())
-        messagebox.showinfo("Saved", p)
+        p = filedialog.asksaveasfilename(
+            parent=root, title="Save machine profile", defaultextension='.csv',
+            initialdir=os.path.dirname(S.path) if S.path else prefs().get('profile_dir'),
+            initialfile=os.path.basename(S.path) if S.path else profile_slug(model.get() or 'machine') + '.csv',
+            filetypes=[("Machine profile", "*.csv")])
+        if not p:
+            return
+        try:
+            save_profile(p, model.get().strip() or os.path.splitext(os.path.basename(p))[0], S.rows)
+        except OSError as e:
+            return messagebox.showerror("Save", f"could not write {p}\n\n{e}")
+        setpath(p)
 
-    ttk.Button(bar, text="Open", command=do_open).pack(side='left', padx=(12, 4))
-    ttk.Button(bar, text="Save", command=do_save).pack(side='left')
+    ttk.Button(bar, text="Open…", command=do_open).pack(side='left', padx=(12, 4))
+    ttk.Button(bar, text="Save…", command=do_save).pack(side='left')
+    l_path.pack(side='left', padx=12)
 
     # ================= tab 2: run =================
     rf = ttk.Frame(nb); nb.add(rf, text=' 2. Run ')
     f1 = ttk.Frame(rf); f1.pack(fill='x', padx=8, pady=8)
     fields = {}
-    for i, (lbl, key, dflt, w) in enumerate((("Unit S/N", 'sn', '', 16), ("Coil turns", 'turns', '1', 5),
+    for i, (lbl, key, dflt, w) in enumerate((("Unit S/N", 'sn', '', 16), ("Coil turns", 'turns', '3', 5),
                                              ("V-tap mult", 'vmult', '1.0', 5), ("Fire CH", 'fire_ch', '2', 4),
                                              ("Headroom steps", 'headroom', '2', 4))):
         ttk.Label(f1, text=lbl).grid(row=0, column=2 * i, padx=(0 if i == 0 else 12, 4))
@@ -1879,7 +2014,7 @@ def wizard():
         try:
             args = make_parser().parse_args([])      # every default, from the one place
             args.load = S.rows[0]['load_ohm']
-            args.turns = int(fields['turns'].get() or 1)
+            args.turns = int(fields['turns'].get() or 3)
             args.vmult = float(fields['vmult'].get() or 1.0)
             args.fire_ch = int(fields['fire_ch'].get() or 2)
             args.headroom = int(fields['headroom'].get() or 0)
@@ -1902,23 +2037,35 @@ def wizard():
         log("forcing re-arm…")
 
     def save_results():
-        done = [i for i in range(len(S.rows)) if i in S.meas]
-        if not done:
+        if not S.meas:
             return messagebox.showinfo("Save", "nothing measured yet")
         sn = (fields['sn'].get().strip() or 'NA').replace(' ', '_')
-        p = os.path.join(app_dir(), f"{profile_slug(machine.get() or 'machine')}_{sn}_results.csv")
-        with open(p, 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['sn', 'model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
-                        'measured_W', 'pass', 'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg'])
-            for i in done:
-                r, m = S.rows[i], S.meas[i]
-                got = m['P_from_VxI (mean v*i)']
-                ok = verdict(got, r['expected_W'], r['tol_pct'])[0] if r['expected_W'] else ''
-                w.writerow([sn, model.get(), r['mode'], g(r['setting']), g(r['load_ohm']),
-                            g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
-                            round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
-                            round(m['Phase_deg'], 1)])
+        name = profile_slug(os.path.splitext(os.path.basename(S.path))[0] if S.path else model.get() or 'machine')
+        p = filedialog.asksaveasfilename(
+            parent=root, title="Save test results", defaultextension='.pdf',
+            initialdir=prefs().get('results_dir'), initialfile=f"{name}_{sn}_results.pdf",
+            filetypes=[("PDF report", "*.pdf"), ("CSV data", "*.csv")])
+        if not p:
+            return
+        try:
+            if p.lower().endswith('.csv'):
+                with open(p, 'w', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(['sn', 'model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
+                                'measured_W', 'pass', 'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg'])
+                    for i in sorted(S.meas):
+                        r, m = S.rows[i], S.meas[i]
+                        got = m['P_from_VxI (mean v*i)']
+                        ok = verdict(got, r['expected_W'], r['tol_pct'])[0] if r['expected_W'] else ''
+                        w.writerow([sn, model.get(), r['mode'], g(r['setting']), g(r['load_ohm']),
+                                    g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
+                                    round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
+                                    round(m['Phase_deg'], 1)])
+            else:
+                results_pdf(p, sn, model.get().strip() or name, S.rows, dict(S.meas))
+        except OSError as e:
+            return messagebox.showerror("Save", f"could not write {p}\n\n{e}")
+        prefs(results_dir=os.path.dirname(p))
         messagebox.showinfo("Saved", p)
 
     btns = ttk.Frame(rf); btns.pack(fill='x', padx=8, pady=(0, 8))
@@ -1928,7 +2075,7 @@ def wizard():
     ttk.Button(btns, text="ReRead selected", command=reread).pack(side='left', padx=(20, 6))
     ttk.Button(btns, text="Re-run whole mode", command=rerun_mode).pack(side='left')
     ttk.Button(btns, text="Force re-arm", command=force_rearm).pack(side='left', padx=6)
-    ttk.Button(btns, text="Save results CSV", command=save_results).pack(side='right')
+    ttk.Button(btns, text="Save results…", command=save_results).pack(side='right')
 
     def pump():
         try:
@@ -2242,25 +2389,30 @@ def demo():
     assert band_from('minmax', 0, 7) == (3.5, 100.0)          # Ellman's "0 to 7 W" bottom band
     assert band_from('minmax', 0, 0) == (0.0, 0.0)            # a dead setting must not divide by zero
     assert g(3.0) == 3 and g(3.5) == 3.5
+    assert setting_range(10, 120, 10) == [float(x) for x in range(10, 121, 10)]
+    assert setting_range(0, 125, 10)[-2:] == [120.0, 125.0] and setting_range(0, 10, 1) == [float(x) for x in range(11)]
+    assert setting_range(0, 1, 0.1)[-1] == 1.0 and len(setting_range(0, 1, 0.1)) == 11   # no float drift
     assert profile_slug('Ellman Dento-Surg 90 FFP') == 'ellman-dento-surg-90-ffp'
     # and the profile must survive the round trip to disk that the wizard's Save/Open does
     import tempfile
-    _rd = globals()['refs_dirs']
     with tempfile.TemporaryDirectory() as td:
-        globals()['refs_dirs'] = lambda: [td]
-        try:
-            save_profile('Ellman Dento-Surg 90 FFP', 'Ellman', [
-                {'mode': 'fulg', 'setting': 6.0, 'load_ohm': 500.0, 'expected_W': e1, 'tol_pct': t1},
-                {'mode': 'cut', 'setting': 0.0, 'load_ohm': 500.0, 'expected_W': 3.5, 'tol_pct': 100.0}])
-            assert list_profiles() == ['ellman-dento-surg-90-ffp']
-            mdl, back = load_profile('Ellman Dento-Surg 90 FFP')
-            assert mdl == 'Ellman' and [r['mode'] for r in back] == ['cut', 'fulg']   # sorted on load
-            lo, hi = band_to('minmax', back[1]['expected_W'], back[1]['tol_pct'])
-            assert abs(lo - 25) < 1e-9 and abs(hi - 37) < 1e-9, (lo, hi)
-            # the same file has to read back through the path --watch/--compare already use
-            assert identify(ref_bands('ellman-dento-surg-90-ffp'), 'fulg', 30.0)[0] == [6]
-        finally:
-            globals()['refs_dirs'] = _rd
+        pp = os.path.join(td, 'dento.csv')
+        save_profile(pp, 'Ellman', [
+            {'mode': 'fulg', 'setting': 6.0, 'load_ohm': 500.0, 'expected_W': e1, 'tol_pct': t1},
+            {'mode': 'cut', 'setting': 0.0, 'load_ohm': 500.0, 'expected_W': 3.5, 'tol_pct': 100.0}])
+        mdl, back = load_profile(pp)
+        assert mdl == 'Ellman' and [r['mode'] for r in back] == ['cut', 'fulg']   # sorted on load
+        lo, hi = band_to('minmax', back[1]['expected_W'], back[1]['tol_pct'])
+        assert abs(lo - 25) < 1e-9 and abs(hi - 37) < 1e-9, (lo, hi)
+        # the same file has to read back through the path --watch/--compare already use
+        assert identify(ref_bands(pp), 'fulg', 30.0)[0] == [6]
+        # wizard results PDF: one pass, one fail, one unmeasured-spec row
+        mt = {'P_from_VxI (mean v*i)': 30.0, 'Vrms': 122.5, 'Irms': 0.245, 'Freq_Hz': 4e6, 'Phase_deg': 1.0}
+        np_, ng = results_pdf(os.path.join(td, 'r.pdf'), 'SN1', 'Ellman', back,
+                              {0: dict(mt, **{'P_from_VxI (mean v*i)': 9.0}), 1: mt})
+        assert (np_, ng) == (1, 2), (np_, ng)
+        with open(os.path.join(td, 'r.pdf'), 'rb') as f:
+            assert f.read(5) == b'%PDF-'
     print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, "
           "snap125, clip/rail detection, session/verdict, min-max == +/- profile round trip")
 
@@ -2301,7 +2453,7 @@ def make_parser():
     ap.add_argument('--mode', default='?', help='e.g. "cut 50W" / "coag"')
     ap.add_argument('--setpoint', default='?', help='front-panel watts')
     ap.add_argument('--load', type=float, default=500, help='load resistance (ohm)')
-    ap.add_argument('--turns', type=int, default=1, help='passes of the ESU wire through the Pearson coil (N turns = Nx signal, amps divided back by N)')
+    ap.add_argument('--turns', type=int, default=3, help='passes of the ESU wire through the Pearson coil (N turns = Nx signal, amps divided back by N)')
     ap.add_argument('--vmult', type=float, default=1.0, help='voltage tap multiplier = load-divider ratio when the probe is across only PART of the load (e.g. 3 when probing 1 of 3 equal series resistors). Corrects V so all 3 power methods agree.')
     ap.add_argument('--no-autoscale', action='store_true', help='skip auto V/div + timebase; use the scope as-is')
     ap.add_argument('--cycles', type=int, default=6, help='approx # of waveform cycles to show on screen (autoscale timebase)')

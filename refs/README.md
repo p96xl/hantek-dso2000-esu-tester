@@ -34,8 +34,8 @@ Valleylab Force FX-C,cut,100,300,300,20
 Manuals and front panels often disagree. Add the panel spelling as duplicate rows with the same
 numbers rather than renaming anything — costs nothing, removes a whole class of confusion.
 
-Ellman example: the manual says Cut/Coag and Hemo, the panel says BLEND and COAG. So
-`refs/ellman-surgitron-4.0.csv` carries `cutcoag` **and** `blend`, `hemo` **and** `coag`.
+Ellman example: the manual says Cut/Coag and Hemo, the panel says BLEND and COAG. So that
+machine's table carries `cutcoag` **and** `blend`, `hemo` **and** `coag`.
 
 ## Adding a machine
 
@@ -48,10 +48,8 @@ Ellman example: the manual says Cut/Coag and Hemo, the panel says BLEND and COAG
    whether your load is at the design match point) and any **open-circuit voltage** figure
    (a free HV-probe calibration reference at the machine's own frequency).
 
-## On hand
+## Not in this repo
 
-| File | Machine | Notes |
-|---|---|---|
-| `ellman-surgitron-4.0.csv` | Ellman Surgitron 4.0 Dual RF/120 IEC | Fig 8.1, ±20%. Dial is **0–100 percent**, not 0–10. Mono 500 Ω, bipolar 200 Ω. Power vs load **peaks at exactly 500 Ω**. |
-
-Queued: Valleylab Force FX-C, Force Triad, Bovie AEX.
+`refs/*.csv` is gitignored and no table ships in the exe. The numbers are transcribed from
+vendor service manuals, so they stay on the bench (or a shared drive), not on GitHub. This
+file is the format; write your own, or build one in the wizard and **Save…** it anywhere.

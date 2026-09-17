@@ -5,8 +5,16 @@ oscilloscope over SCPI/USBTMC — built for verifying electrosurgical unit (ESU)
 into a rated resistive load. Captures both channels, computes power three ways, plots the waveform,
 and writes a printable HTML report. Ships a dead-simple GUI for bench techs.
 
-Measurement rig: **Ch1** = voltage across the load (HV probe), **Ch2** = current via a **Pearson 110A**
-current monitor. This is a DIY equivalent of a BC Biomedical ESU-2050 analyzer.
+Measurement rig, as built and used here:
+
+| | Part | Notes |
+|---|---|---|
+| Scope | **Hantek DSO2C50** (DSO2000 series) | 2 ch, 50 MHz, USBTMC only — no LAN |
+| Ch1 — voltage | **100:1 HV probe** across the load | Scope channel set to **100×**; 100:1 keeps a 1 kV ESU peak inside the probe's range and the scope's input |
+| Ch2 — current | **Pearson 110A** current monitor | 0.1 V/A into 1 MΩ; run the ESU lead through it **3×** (`--turns 3`) to lift a small current off the noise floor |
+
+That combination — DSO2C50 + Pearson 110A + 100:1 probe — is a DIY equivalent of a
+BC Biomedical ESU-2050 analyzer.
 
 > The DSO2000 firmware's SCPI is a stripped, quirky Rigol clone — no `:MEASure` subsystem, no screenshot,
 > and waveform export is the undocumented `PRIVate:WAVeform:DATA:ALL?` with a 128-byte-per-packet header.
@@ -44,8 +52,8 @@ The scope talks USBTMC, which needs a USB driver:
 
 | Channel | Connect | Scope setting |
 |---------|---------|---------------|
-| **Ch1** | Voltage across the load via HV probe | Set the channel **probe ratio to your probe** (e.g. 10×/1000×) — the scope reports true volts |
-| **Ch2** | Pearson 110A current monitor (BNC) | Probe ratio **1×**; **DC coupling**; turn **V/div down** so the current fills several divisions |
+| **Ch1** | Voltage across the load via the **100:1 HV probe** | Set the channel **probe ratio to 100×** (match whatever probe you use) — the scope then reports true volts |
+| **Ch2** | **Pearson 110A** current monitor (BNC), ESU lead through it 3× | Probe ratio **1×**; **DC coupling**; turn **V/div down** so the current fills several divisions |
 
 Then edit the constants at the top of `esu_test.py`:
 ```python
@@ -93,7 +101,7 @@ python esu_test.py --sn ELLMAN123 --mode "cut 50W" --load 500 --setpoint 50 --tu
 | `--setpoint` | `?` | Front-panel setting (for the report) | `--setpoint 50` |
 | `--ref` | `esu_reference.csv` | OEM table used by `--compare`. One file per machine model | `--ref refs/bovie_a1350.csv` |
 | `--load` | `500` | Load resistance in ohm — **must be the real value**, the `Vrms²/R` and `Irms²·R` powers depend on it | `--load 200` |
-| `--turns` | `1` | Passes of the ESU wire through the Pearson coil. Coil reads amp-**turns**, so N turns = N× signal off the noise floor; amps are divided back by N in software | `--turns 3` |
+| `--turns` | `3` | Passes of the ESU wire through the Pearson coil. Coil reads amp-**turns**, so N turns = N× signal off the noise floor; amps are divided back by N in software | `--turns 3` |
 | `--cycles` | `6` | Approx # of waveform cycles autoscale puts on screen (snaps to nearest scope timebase gear) | `--cycles 5` |
 | `--no-autoscale` | off | Skip auto V/div + timebase; use the scope exactly as set | `--no-autoscale` |
 | `--acq` | `HRESolution` | Acquisition type: `HRESolution` \| `AVERage` \| `PEAK` \| `NORMal` (HRES cuts noise; use `NORMal` for one-shot bursts) | `--acq AVERage` |
@@ -200,7 +208,7 @@ Format, how to add a machine, and the front-panel-vs-manual naming trap: **`refs
 Settings past the ends of the table are **reported as skipped, never extrapolated**:
 
 ```
-SKIPPED 2 row(s) not covered by refs/ellman-surgitron-4.0.csv: modes=['cut'], settings -5-120
+SKIPPED 2 row(s) not covered by refs/surgitron.csv: modes=['cut'], settings -5-120
 reference covers: bipolar 0-100, blend 0-100, coag 0-100, cut 0-100, cutcoag 0-100, fulg 0-100, hemo 0-100
 ```
 
@@ -325,19 +333,17 @@ Sweep `--load` and watch `P (mean v·i)` climb toward the dial; the peak is the 
 Double-click the exe. Two tabs, no command line.
 
 ### Tab 1 — Machine profile
-A profile is just a `refs/<machine>.csv` — the **same file** `--compare` and `--watch --ref` already read. Build one once per machine model, reuse it forever.
+A profile is just a `<machine>.csv` — the **same format** `--compare` and `--watch --ref` already read. Build one once per machine model, keep it anywhere (a shared drive works), reuse it forever. Nothing is bundled in the exe.
 
-1. Type a machine name (or pick a saved one) → **Open**, or start empty.
-2. **Add a mode**: name it, give the setting range, give the load. Ellman Dento-Surg is four calls: `cut 0–10 @500Ω`, `cutcoag 0–10`, `coag 0–10`, `fulg 0–6`. A Force FX-C would be the same at `300Ω`.
+1. **Open…** → pick a profile file, or start empty. The dialog remembers the last folder.
+2. **Add a mode**: name it, give the setting range and step (e.g. `10 to 120 step 10`), give the load. Ellman Dento-Surg is four calls: `cut 0–10 @500Ω`, `cutcoag 0–10`, `coag 0–10`, `fulg 0–6`. A Force FX-C would be the same at `300Ω`.
 3. Pick the **spec style your manual uses** — the wizard takes either:
    - **min – max** (Ellman prints "25 – 37 W")
    - **nominal ± %** (Valleylab prints "31 W ± 19.4%")
 
    Both store the identical band, so the same machine grades the same either way — asserted in `--demo`. Flip the radio button to *read back* a table in the other style.
-4. Select the row(s) a spec applies to, type the two numbers, **Apply**. Select several rows at once when a run of settings shares a band.
-5. **Save** → `refs/<machine>.csv`, next to the exe. It reopens instantly next time.
-
-`refs/ellman-dento-surg-90-ffp.csv` already ships with the exe, so that machine needs no setup.
+4. Select the row(s) a spec applies to, type the numbers, **Apply**. The two fields follow the style (Min/Max or Nominal/± %); leave a field blank to keep that value, e.g. only ± % to change the tolerance on a run of rows.
+5. **Save…** → choose where. A shared drive keeps one copy per machine model for the whole bench.
 
 ### Tab 2 — Run
 Fill S/N, coil turns, tap multiplier. Leave **Envelope** ticked for anything but pure cut.
@@ -357,7 +363,7 @@ Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expec
 - **ReRead selected** → clears that row, aims back at it, **and re-ranges the scope for it immediately**. Jump from setting 9 back to setting 2 and the vertical scale follows before you touch the footswitch, rather than staying on setting 9's range until the next burst.
 - **Re-run whole mode** → clears every row of that mode and starts it over.
 - **Force re-arm** → escape hatch if it thinks the pedal is still down when it isn't.
-- **Save results CSV** → `<machine>_<sn>_results.csv` with the measured value, the spec, and the pass/fail beside each other.
+- **Save results…** → a file dialog (remembers the last folder), default `<machine>_<sn>_results.pdf`: the graded table (spaced, gap between modes) with the measured-vs-spec chart after it — each mode its own marker shape, fill and line dash, so it reads on a black-and-white printout. Pick *CSV* in the type box for raw data instead.
 
 ### When the scope lies about a measurement
 `refs/dso2c50-scpi-commands.md` records that fw 1.0.8 returns a *frequency* for `VRMS` (16670 / 25000 / 5556 against real volts) and desyncs its `:MEASure` reply buffer when other queries are interleaved with it. That is not a curiosity — one 4000 V "idle" reading on CH2 set the fire-detect threshold to **12 kV, ~8×10¹¹ W into 500 Ω**, and armed a detector nothing could ever trip.
@@ -444,9 +450,9 @@ Every warning the CLI prints (clipping, envelope-window too short, coherent samp
 ```
 build.bat
 ```
-Produces a single `dist\esu_test.exe` (Python + all libs + `libusb` + the shipped `refs\*.csv`
-bundled). Copy it anywhere; each target PC still needs the one-time driver step above.
-Machine profiles the wizard saves land in a `refs\` folder **next to the exe**, not inside it.
+Produces a single `dist\esu_test.exe` (Python + all libs + `libusb` bundled). Copy it anywhere;
+each target PC still needs the one-time driver step above. No machine profiles are bundled —
+the wizard opens and saves them through a file dialog. Last-used folders: `%USERPROFILE%\.esu_test.json`.
 
 **`build.bat` is the only source of truth for the build.** `esu_test.spec` is *regenerated* by
 it on every run and is gitignored — editing the spec has no effect.

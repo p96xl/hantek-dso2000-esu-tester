@@ -39,7 +39,6 @@ REM (CLI text modes like --calcheck/--list still run, but print nowhere on the e
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --collect-all pyvisa --collect-all pyvisa_py --collect-all usb ^
   --add-binary "libusb-1.0.dll;." ^
-  --add-data "refs/*.csv;refs" ^
   esu_test.py
 if errorlevel 1 (
     echo.
@@ -57,6 +56,6 @@ echo.
 echo Done. Single file is dist\esu_test.exe  -- copy it anywhere.
 dir "dist\esu_test.exe" | findstr /i "esu_test.exe"
 echo.
-echo Machine profiles the wizard saves land in a refs\ folder NEXT TO the exe.
+echo No machine profiles are bundled: the wizard opens/saves them wherever you pick (e.g. a shared drive).
 echo On each target PC once: run Zadig, pick the scope USBTMC interface, Install WinUSB.
 echo Then run:  esu_test.exe --list   to confirm the scope is seen.

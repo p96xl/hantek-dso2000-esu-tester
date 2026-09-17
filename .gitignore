@@ -28,3 +28,10 @@ Screenshot*.png
 # bench output from --watch (rows carry per-unit measurements)
 *_bursts.csv
 *_bursts.csv.old
+
+# vault notes staged while the Obsidian MCP was down — destined for the vault, not the repo
+vault-pending/
+
+# machine reference tables — transcribed from vendor service manuals, kept off GitHub.
+# The wizard opens/saves them through a file dialog; refs/README.md says how to write one.
+refs/*.csv
