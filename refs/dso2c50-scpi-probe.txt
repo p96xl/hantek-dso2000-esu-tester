@@ -1,0 +1,127 @@
+# DSO2C50 fw 1.0.8 — SCPI capability probe, 2026-09-09
+# 94 of 101 responded. Values reflect an idle scope (DC on CH1, CH2 open).
+# Method + analysis: vault note Projects/Hardware/ESU-Output-Test-Bench/Index.md
+# status<TAB>command<TAB>response
+
+# memory depth — deeper captures = better envelope windows
+DEAD	:ACQuire:DEPMem?	USBTimeoutError
+DEAD	:ACQuire:MODE?	USBTimeoutError
+OK	:ACQuire:POINts?	4000
+OK	:ACQuire:SRATe?	50000
+OK	:ACQuire:TYPE?	NORMal
+OK	:ACQuire:COUNt?	4
+
+# trigger — tech currently sets AUTO by hand or captures come back empty
+OK	:TRIGger:STATus?	NOTRIG
+OK	:TRIGger:SWEep?	AUTO
+OK	:TRIGger:MODe?	EDGE
+OK	:TRIGger:MODE?	EDGE
+OK	:TRIGger:EDGe:SOURce?	CHANnel1
+OK	:TRIGger:EDGe:SLOPe?	RISIng
+OK	:TRIGger:EDGe:LEVel?	0.000000e+00
+OK	:TRIGger:HOLDoff?	0.000001000000
+OK	:TRIGger:COUPling?	DC
+
+# coupling + per-channel setup — DC coupling is mandatory, also set by hand
+OK	:CHANnel1:COUPling?	DC
+OK	:CHANnel2:COUPling?	DC
+OK	:CHANnel1:DISPlay?	1
+OK	:CHANnel2:DISPlay?	1
+OK	:CHANnel1:PROBe?	1.000e+02
+OK	:CHANnel2:PROBe?	1.000e+00
+OK	:CHANnel1:BWLimit?	20M
+OK	:CHANnel1:INVert?	0
+OK	:CHANnel1:VERNier?	OFF
+
+# timebase
+OK	:TIMebase:SCALe?	5.000000e-03
+DEAD	:TIMebase:OFFSet?	USBTimeoutError
+OK	:TIMebase:MODe?	MAIN
+OK	:TIMebase:WINDow:ENABle?	OFF
+OK	:TIMebase:WINDow:SCALe?	5.000e-05
+OK	:TIMebase:WINDow:POSition?	0.000000e+00
+
+# measure — 33 item types
+OK	:MEASure:CHANnel1:ITEM? VMAX	-2.000e+01
+OK	:MEASure:CHANnel1:ITEM? VMIN	-2.800e+01
+OK	:MEASure:CHANnel1:ITEM? VPP	4.000e+00
+OK	:MEASure:CHANnel1:ITEM? VTOP	-2.400e+01
+OK	:MEASure:CHANnel1:ITEM? VBASe	-2.800e+01
+OK	:MEASure:CHANnel1:ITEM? VAMP	4.000e+00
+OK	:MEASure:CHANnel1:ITEM? VAVG	-2.409e+01
+OK	:MEASure:CHANnel1:ITEM? VRMS	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? OVERshoot	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PREShoot	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? MARea	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? MPARea	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PERiod	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? FREQuency	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? RTIMe	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? FTIMe	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PWIDth	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? NWIDth	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PDUTy	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? NDUTy	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? RDELay	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? FDELay	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? RPHase	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? FPHase	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? VUPPer	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? VMID	-2.400e+01
+OK	:MEASure:CHANnel1:ITEM? VLOWer	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? VARIance	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PVRMS	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PPULses	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? NPULses	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? PEDGes	0.000e+00
+OK	:MEASure:CHANnel1:ITEM? NEDGes	0.000e+00
+
+# measure control
+OK	:MEASure:ENABle?	ON
+OK	:MEASure:SOURce?	CHANnel1
+OK	:MEASure:ADISplay?	OFF
+DEAD	:MEASure:MDISplay?	USBTimeoutError
+
+# waveform export
+OK	:WAVeform:XINCrement?	2e-05
+OK	:WAVeform:FORMat?	WORD
+OK	:WAVeform:SOURce?	CHANnel1
+OK	:WAVeform:POINts?	0
+OK	:WAVeform:YINCrement?	40000
+DEAD	:WAVeform:PREamble?	USBTimeoutError
+DEAD	:WAVeform:MODE?	USBTimeoutError
+
+# system / identity
+OK	*IDN?	undefined, DSO2C50, CN5614135001512, 1.0.8(251205.00)
+OK	*OPC?	1
+OK	*ESR?	32
+OK	*STB?	4
+DEAD	*OPT?	USBTimeoutError
+OK	:SYSTem:ERRor?	-113
+OK	:SYSTem:VERSion?	"
+OK	:SYSTem:LANGuage?	;
+OK	:SYSTem:LOCKed?	"
+OK	:SYSTem:PON?	DEFault
+
+# cursor — automatic on-screen readout
+OK	:CURSor:MODE?	OFF
+OK	:CURSor:MANual:TYPE?	Y
+OK	:CURSor:MANual:SOURce?	MATH
+OK	:CURSor:MANual:AXValue?	1.000000e-02
+OK	:CURSor:MANual:AYValue?	2.000000e-05
+OK	:CURSor:TRACk:SOURcea?	MATH
+
+# math
+OK	:MATH:DISPlay?	OFF
+OK	:MATH:OPERator?	ADD
+OK	:MATH:SCALe?	1.000e-05
+OK	:MATH:OFFSet?	0
+OK	:MATH:FFT:SOURce?	CHANnel1
+OK	:MATH:FFT:WINDow?	HANNing
+
+# display / misc
+OK	:DISPlay:TYPE?	VECTors
+OK	:DISPlay:GRID?	REAL
+OK	:DISPlay:GBRightness?	60
+OK	:DISPlay:WBRightness?	100
+OK	:CALibrate:STATus?	1
