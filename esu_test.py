@@ -877,7 +877,7 @@ def compare(args):
                              + "\n  Add one as refs/<machine>.csv — see refs/README.md")
     args.ref = ref
     curves, models = {}, set()
-    with open(args.ref, newline='') as f:
+    with open(args.ref, newline='', encoding='utf-8-sig') as f:
         for r in csv.DictReader(f):
             curves.setdefault(r['mode'].strip().lower(), []).append(
                 (float(r['setting']), float(r['expected_W']), float(r['tol_pct']), float(r['load_ohm'])))
@@ -897,7 +897,7 @@ def compare(args):
         return tuple(float(np.interp(setting, xs, [p[i] for p in c])) for i in (1, 2, 3))
 
     rows, skipped = [], []
-    with open(args.compare, newline='') as f:
+    with open(args.compare, newline='', encoding='utf-8-sig') as f:
         for r in csv.DictReader(f):
             try:
                 setting = float(r['setting'])
@@ -968,7 +968,7 @@ def session(args):
                'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg', 'spread_pct']
         rows, index = [], {}          # index maps (mode,setting)->row position; named runs only
         if os.path.exists(csvpath):   # resume: reread so a re-run keeps overwriting, not duplicating
-            with open(csvpath, newline='') as fh:
+            with open(csvpath, newline='', encoding='utf-8-sig') as fh:
                 for r in csv.DictReader(fh):
                     rows.append([r.get(c, '') for c in HDR])   # tolerates older column sets
                     if named:
@@ -976,7 +976,7 @@ def session(args):
             print(f"Resuming {csvpath} ({len(rows)} existing row(s))")
 
         def save():
-            with open(csvpath, 'w', newline='') as fh:
+            with open(csvpath, 'w', newline='', encoding='utf-8') as fh:
                 wr = csv.writer(fh); wr.writerow(HDR); wr.writerows(rows)
 
         print(f"\nLogging to {csvpath} (mode={args.mode}, load={args.load:g} ohm)")
@@ -1073,14 +1073,14 @@ def prefs(**upd):
     import json
     p = os.path.join(os.path.expanduser('~'), '.esu_test.json')
     try:
-        with open(p) as f:
+        with open(p, encoding='utf-8') as f:
             d = json.load(f)
     except (OSError, ValueError):
         d = {}
     if upd:
         d.update(upd)
         try:
-            with open(p, 'w') as f:
+            with open(p, 'w', encoding='utf-8') as f:
                 json.dump(d, f)
         except OSError:
             pass            # losing a remembered folder is not worth an error dialog
@@ -1113,7 +1113,7 @@ def load_profile(path):
     """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct}, ...]) sorted mode then setting."""
     import csv
     rows, model = [], ''
-    with open(path, newline='') as f:
+    with open(path, newline='', encoding='utf-8-sig') as f:
         for r in csv.DictReader(f):
             if not (r.get('mode') or '').strip():
                 continue                 # Excel loves to leave trailing all-comma rows
@@ -1127,7 +1127,7 @@ def load_profile(path):
 
 def save_profile(path, model, rows):
     import csv
-    with open(path, 'w', newline='') as f:
+    with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(PROF_HDR)
         for r in rows:
             w.writerow([model, r['mode'], g(r['setting']), g(r['load_ohm']),
@@ -1235,7 +1235,7 @@ def ref_bands(ref):
         if not os.path.exists(ref):
             return {}
     out = {}
-    with open(ref, newline='') as f:
+    with open(ref, newline='', encoding='utf-8-sig') as f:
         for r in csv.DictReader(f):
             if not (r.get('mode') or '').strip():
                 continue
@@ -1525,13 +1525,13 @@ def watch(args):
         # An older log has the three dead scope columns. Appending rows of a different width
         # would silently misalign it, so move it aside rather than corrupt real bench data.
         if os.path.exists(csvpath):
-            with open(csvpath, newline='') as _f:
+            with open(csvpath, newline='', encoding='utf-8-sig') as _f:
                 first = next(csv.reader(_f), [])
             if first and first != HDR:
                 os.replace(csvpath, csvpath + '.old')
                 print(f"  NOTE: {csvpath} had the old column set — kept as {csvpath}.old")
         new_file = not os.path.exists(csvpath)
-        fh = open(csvpath, 'a', newline=''); wr = csv.writer(fh)
+        fh = open(csvpath, 'a', newline='', encoding='utf-8'); wr = csv.writer(fh)
         if new_file: wr.writerow(HDR); fh.flush()
         print(f"  logging to {csvpath}   (Ctrl-C to stop)")
 
@@ -1756,6 +1756,14 @@ def wizard():
                               crefresh=lambda: None, cnames=[])
 
     root = tk.Tk(); root.title("ESU Calibration Wizard")
+
+    def oops(*_exc):
+        """--windowed has no console, so an unhandled callback exception is silence: the tech
+        clicks Save, nothing happens, nothing explains why. Put it on screen."""
+        import traceback
+        messagebox.showerror("Unexpected error", traceback.format_exc())
+
+    root.report_callback_exception = oops
     root.geometry("1000x820")
     S.style = tk.StringVar(value='minmax')
     nb = ttk.Notebook(root); nb.pack(fill='both', expand=True)
@@ -1901,7 +1909,7 @@ def wizard():
             return
         try:
             save_profile(p, model.get().strip() or os.path.splitext(os.path.basename(p))[0], S.rows)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             return messagebox.showerror("Save", f"could not write {p}\n\n{e}")
         setpath(p)
 
@@ -2123,7 +2131,7 @@ def wizard():
             return
         try:
             if p.lower().endswith('.csv'):
-                with open(p, 'w', newline='') as f:
+                with open(p, 'w', newline='', encoding='utf-8') as f:
                     w = csv.writer(f)
                     w.writerow(['sn', 'model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
                                 'measured_W', 'pass', 'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg'])
@@ -2137,7 +2145,7 @@ def wizard():
                                     round(m['Phase_deg'], 1)])
             else:
                 results_pdf(p, sn, model.get().strip() or name, S.rows, dict(S.meas))
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             return messagebox.showerror("Save", f"could not write {p}\n\n{e}")
         prefs(results_dir=os.path.dirname(p))
         messagebox.showinfo("Saved", p)
@@ -2267,10 +2275,10 @@ def wizard():
             return
         # The note rides in the model column, so every report off this profile says it is derived.
         note = (f"{model.get().strip() or base} [{'+'.join(picked)} spec restated at "
-                f"{g(target)}Ω, {mdl} model]")
+                f"{g(target)} ohm, {mdl} model]")
         try:
             save_profile(p, note, rows)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             return messagebox.showerror("Convert", f"could not write {p}\n\n{e}")
         if messagebox.askyesno("Converted", f"{p}\n\nOpen it on tab 1 now?"):
             S.rows, S.meas, S.cursor = rows, {}, None
@@ -2642,6 +2650,16 @@ def demo():
         assert abs(lo - 25) < 1e-9 and abs(hi - 37) < 1e-9, (lo, hi)
         # the same file has to read back through the path --watch/--compare already use
         assert identify(ref_bands(pp), 'fulg', 30.0)[0] == [6]
+        # A profile note carries Ω. Windows' default encoding is cp1252, which CANNOT encode it:
+        # writing without encoding='utf-8' raised UnicodeEncodeError inside a Tk callback, which
+        # in a --windowed exe goes nowhere -- the tech clicked Save and nothing happened.
+        _np = os.path.join(td, 'note.csv')
+        save_profile(_np, 'ERBE 200S [bipolar restated at 100 ohm ≈ 75 Ω spec]', back)
+        assert load_profile(_np)[0].endswith('75 Ω spec]'), 'non-ASCII must survive the round trip'
+        # and Excel's UTF-8 BOM must not end up glued to the first column name
+        with open(_np, 'w', newline='', encoding='utf-8-sig') as _f:
+            _f.write('model,mode,setting,load_ohm,expected_W,tol_pct\nX,cut,1,500,10,20\n')
+        assert load_profile(_np)[1][0]['mode'] == 'cut', 'a BOM must not break the header'
         # wizard results PDF: one pass, one fail, one unmeasured-spec row
         mt = {'P_from_VxI (mean v*i)': 30.0, 'Vrms': 122.5, 'Irms': 0.245, 'Freq_Hz': 4e6, 'Phase_deg': 1.0}
         np_, ng = results_pdf(os.path.join(td, 'r.pdf'), 'SN1', 'Ellman', back,
@@ -2701,6 +2719,13 @@ def make_parser():
 
 
 if __name__ == '__main__':
+    # 20-odd prints here carry Ω, ±, µ or →. A Windows console defaults to cp1252, which cannot
+    # encode any of them -- printing one killed the run mid-test. Never let a label crash a bench tool.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = make_parser()
     a = ap.parse_args()
     if a.wizard or len(sys.argv) == 1: wizard()   # no args (double-click) -> the wizard
