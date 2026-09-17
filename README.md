@@ -330,7 +330,7 @@ Sweep `--load` and watch `P (mean v·i)` climb toward the dial; the peak is the 
 
 ## The calibration wizard (for techs)
 
-Double-click the exe. Two tabs, no command line.
+Double-click the exe. Three tabs, no command line.
 
 ### Tab 1 — Machine profile
 A profile is just a `<machine>.csv` — the **same format** `--compare` and `--watch --ref` already read. Build one once per machine model, keep it anywhere (a shared drive works), reuse it forever. Nothing is bundled in the exe.
@@ -364,6 +364,32 @@ Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expec
 - **Re-run whole mode** → clears every row of that mode and starts it over.
 - **Force re-arm** → escape hatch if it thinks the pedal is still down when it isn't.
 - **Save results…** → a file dialog (remembers the last folder), default `<machine>_<sn>_results.pdf`: the graded table (spaced, gap between modes) with the measured-vs-spec chart after it — each mode its own marker shape, fill and line dash, so it reads on a black-and-white printout. Pick *CSV* in the type box for raw data instead.
+
+### Tab 3 — Load convert (oddball spec load → a load you can build)
+An ERBE 200S is specified into **75 Ω**. A series-bypass load bank with a hardwired 100 Ω base
+cannot make 75 Ω at all, so the spec has to be restated at a load you have — say 100 Ω.
+
+**This is an assumption, not arithmetic.** An ESU is not a fixed source: what it delivers into
+100 Ω when the manual specified 75 Ω depends on how that generator regulates. So the tab shows
+what **every** model says and makes you choose:
+
+| Model | P at the new load | Use it when |
+|---|---|---|
+| **power-regulated** | unchanged | the manual's power-vs-load diagram is flat across both loads (common on modern units) |
+| **manual's curve** | read off the diagram | **the rigorous one** — type a few `R:W` points for that mode, e.g. `50:80 75:100 100:95` |
+| **matched source** | `P × 4·Rs·R/(Rs+R)²` | the spec load is the design match point; mild correction, derates either direction |
+| **voltage source** | `P × Rs/R` | the voltage-limited region (low settings on many units) |
+| **current source** | `P × R/Rs` | the current-limited region |
+
+For 75 → 100 Ω those span **×0.75 to ×1.33** — a 120 W bipolar spec becomes anywhere from 90 W
+to 160 W. When the models disagree by more than the tolerance you are grading against, the tab
+says so in red. Get the diagram, or measure one setting at both loads on a known-good unit.
+
+Pick the mode(s), type the target Ω, pick a model, and **Write converted profile…** saves a
+*separate* file (`<machine>-100ohm.csv`). Tolerance is left alone — the model moves the expected
+value, it does not widen the window. The `model` column records what was done
+(`ERBE 200S [bipolar spec restated at 100Ω, regulated model]`), so every PDF off that profile
+says on its face that it is derived.
 
 ### When the scope lies about a measurement
 `refs/dso2c50-scpi-commands.md` records that fw 1.0.8 returns a *frequency* for `VRMS` (16670 / 25000 / 5556 against real volts) and desyncs its `:MEASure` reply buffer when other queries are interleaved with it. That is not a curiosity — one 4000 V "idle" reading on CH2 set the fire-detect threshold to **12 kV, ~8×10¹¹ W into 500 Ω**, and armed a detector nothing could ever trip.

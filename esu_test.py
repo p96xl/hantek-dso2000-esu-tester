@@ -1135,6 +1135,78 @@ def save_profile(path, model, rows):
     return path
 
 
+# ---- converting an OEM spec from its own test load to a load you can actually build ----
+# An ESU is not a fixed source: what it delivers into 100 ohm when the manual specified 75 ohm
+# depends on how that generator regulates, which is a per-machine fact. So every model here is
+# named, the wizard shows all of them side by side, and the tech picks one -- the tool never
+# quietly guesses. The manual's own power-vs-load diagram ('curve') is the only rigorous one.
+LOAD_MODELS = [
+    ('regulated', 'power-regulated: same watts at both loads',
+     'Most modern generators hold power flat over a load range. Check the manual has a flat '
+     'power-vs-load diagram across BOTH loads before trusting this.'),
+    ('curve', "manual's power-vs-load diagram (enter points)",
+     'The rigorous one: read a few R:W points off the diagram for this mode. Relative watts are '
+     'enough -- only the ratio between the two loads is used.'),
+    ('matched', 'matched source: P = 4·Rs·R/(Rs+R)²',
+     "Assumes the generator's source impedance equals the load the spec was written for, i.e. the "
+     'spec load is the design match point. Mild correction for a small load change.'),
+    ('voltage', 'voltage source: P = 1/R',
+     'The voltage-limited region (low settings on many units). Biggest correction of the four.'),
+    ('current', 'current source: P = R',
+     'The current-limited region.'),
+]
+
+
+def parse_curve(text):
+    """'50:80 75:100 100:95' (ohms:watts off the manual's diagram) -> ([R], [W]), R ascending."""
+    pts = []
+    for tok in text.replace(',', ' ').split():
+        r, _, w = tok.partition(':')
+        if not w:
+            raise ValueError(f"'{tok}' is not R:W")
+        pts.append((float(r), float(w)))
+    if len(pts) < 2:
+        raise ValueError('need at least two R:W points')
+    pts.sort()
+    return [p[0] for p in pts], [p[1] for p in pts]
+
+
+def load_factor(model, rs, r, curve=None):
+    """Multiply an expected-watts spec written for load `rs` by this to get it at load `r`."""
+    if rs <= 0 or r <= 0:
+        raise ValueError('loads must be > 0 ohm')
+    if model == 'curve':
+        xs, ws = curve if curve else (None, None)
+        if not xs:
+            raise ValueError('enter the power-vs-load points first')
+        if not (xs[0] <= rs <= xs[-1] and xs[0] <= r <= xs[-1]):
+            raise ValueError(f'the curve only covers {xs[0]:g}-{xs[-1]:g} ohm; '
+                             f'it must cover both {rs:g} and {r:g}')
+        import numpy as np
+        w_rs = float(np.interp(rs, xs, ws))
+        if not w_rs:
+            raise ValueError(f'the curve reads 0 W at {rs:g} ohm')
+        return float(np.interp(r, xs, ws)) / w_rs
+    return {'regulated': 1.0,
+            'matched': 4 * rs * r / (rs + r) ** 2,
+            'voltage': rs / r,
+            'current': r / rs}[model]
+
+
+def convert_rows(rows, modes, target_r, model, curve=None):
+    """Copy of `rows` with the selected modes' spec restated at `target_r`. Tolerance is left
+    alone -- the model moves the expected value, it does not make the window wider."""
+    modes = {m.strip().lower() for m in modes}
+    out = []
+    for r in rows:
+        r = dict(r)
+        if r['mode'] in modes and r['load_ohm'] != target_r:
+            r['expected_W'] *= load_factor(model, r['load_ohm'], target_r, curve)
+            r['load_ohm'] = float(target_r)
+        out.append(r)
+    return out
+
+
 def setting_range(lo, hi, step):
     """Dial settings lo..hi every `step`, always ending ON hi — the top of the dial is a point
     worth testing even when the step does not land on it (0-125 by 10 -> ..., 120, 125)."""
@@ -1680,7 +1752,8 @@ def wizard():
     import contextlib, csv, queue, threading, types
 
     S = types.SimpleNamespace(rows=[], meas={}, cursor=None, stop=True, thread=None, path='',
-                              q=queue.Queue(), style=None, force=False, reaim=False)
+                              q=queue.Queue(), style=None, force=False, reaim=False,
+                              crefresh=lambda: None, cnames=[])
 
     root = tk.Tk(); root.title("ESU Calibration Wizard")
     root.geometry("1000x820")
@@ -1720,6 +1793,7 @@ def wizard():
                        f"{g(r['load_ohm'])}", f"{a:.4g}", f"{b:.4g}"))
         ptv.selection_set([i for i in sel if i in ptv.get_children()])
         rsync()
+        S.crefresh()
 
     for txt, val in (("min – max   (Ellman)", 'minmax'), ("nominal ± %   (Valleylab)", 'pm')):
         ttk.Radiobutton(sty, text=txt, value=val, variable=S.style,
@@ -2077,6 +2151,140 @@ def wizard():
     ttk.Button(btns, text="Force re-arm", command=force_rearm).pack(side='left', padx=6)
     ttk.Button(btns, text="Save results…", command=save_results).pack(side='right')
 
+    # ================= tab 3: load convert =================
+    cf = ttk.Frame(nb); nb.add(cf, text=' 3. Load convert ')
+    ttk.Label(cf, text="Restate a spec written for an oddball load at a load your bank can build. "
+                       "Source = the profile open on tab 1.", wraplength=960,
+              justify='left').pack(anchor='w', padx=8, pady=(8, 0))
+    c_src = ttk.Label(cf, text="(no profile open)", foreground='#666')
+    c_src.pack(anchor='w', padx=8)
+
+    mid = ttk.Frame(cf); mid.pack(fill='x', padx=8, pady=6)
+    ttk.Label(mid, text="Mode(s) to convert").grid(row=0, column=0, sticky='w')
+    c_modes = tk.Listbox(mid, selectmode='extended', height=6, exportselection=False, width=26)
+    c_modes.grid(row=1, column=0, rowspan=6, sticky='nw', padx=(0, 18))
+    ttk.Label(mid, text="Convert to Ω").grid(row=0, column=1, sticky='w', padx=(0, 4))
+    c_r = ttk.Entry(mid, width=8); c_r.grid(row=0, column=2, sticky='w')
+    S.cmodel = tk.StringVar(value='regulated')
+    for i, (k, lbl, _) in enumerate(LOAD_MODELS):
+        ttk.Radiobutton(mid, text=lbl, value=k, variable=S.cmodel,
+                        command=lambda: crender()).grid(row=1 + i, column=1, columnspan=3, sticky='w')
+    ttk.Label(mid, text="R:W points").grid(row=len(LOAD_MODELS) + 1, column=1, sticky='w', padx=(20, 4))
+    c_curve = ttk.Entry(mid, width=44)
+    c_curve.grid(row=len(LOAD_MODELS) + 1, column=2, columnspan=2, sticky='w')
+
+    c_note = ttk.Label(cf, text="", wraplength=960, justify='left')
+    c_note.pack(anchor='w', padx=8)
+    c_warn = ttk.Label(cf, text="", wraplength=960, justify='left', foreground='#a51c1c')
+    c_warn.pack(anchor='w', padx=8)
+
+    ctv = ttk.Treeview(cf, columns=('mode', 'setting', 'before', 'after', 'f'),
+                       show='headings', height=11)
+    for c, t, w in (('mode', 'Mode', 110), ('setting', 'Setting', 70),
+                    ('before', 'Spec as written', 210), ('after', 'Restated', 210), ('f', '×', 70)):
+        ctv.heading(c, text=t); ctv.column(c, width=w, anchor='center')
+    ctv.pack(fill='both', expand=True, padx=8, pady=6)
+
+    def cpicked():
+        """Selected mode names. Read from the parallel list, never split out of the label --
+        a mode name is free text and may contain spaces."""
+        return [S.cnames[i] for i in c_modes.curselection() if i < len(S.cnames)]
+
+    def crefresh():
+        """Mode list + source label follow whatever tab 1 has open."""
+        keep = set(cpicked())
+        c_modes.delete(0, 'end')
+        loads = {}
+        for r in S.rows:
+            loads.setdefault(r['mode'], set()).add(r['load_ohm'])
+        S.cnames = [m for m, _ in sorted(loads.items())]
+        for i, m in enumerate(S.cnames):
+            c_modes.insert('end', f"{m}   ({', '.join(f'{g(x)}Ω' for x in sorted(loads[m]))})")
+            if m in keep:
+                c_modes.selection_set(i)
+        c_src.configure(text=(S.path or "(unsaved profile on tab 1)") if S.rows else "(no profile open)")
+        crender()
+
+    def crender():
+        ctv.delete(*ctv.get_children())
+        c_warn.configure(text="")
+        picked = cpicked()
+        model = S.cmodel.get()
+        c_note.configure(text=next(d for k, _, d in LOAD_MODELS if k == model))
+        if not picked or not c_r.get().strip():
+            return
+        try:
+            target = float(c_r.get())
+            curve = parse_curve(c_curve.get()) if model == 'curve' else None
+            rows = convert_rows(S.rows, picked, target, model, curve)
+        except (ValueError, ZeroDivisionError, KeyError) as e:
+            return c_warn.configure(text=str(e))
+        # Show what EVERY model says, so the size of the assumption is on screen next to the answer.
+        srcs = sorted({r['load_ohm'] for r in S.rows
+                       if r['mode'] in set(picked) and r['load_ohm'] != target})
+        spread, worst = [], 1.0
+        for rs in srcs:
+            fs = {k: load_factor(k, rs, target) for k, _, _ in LOAD_MODELS if k != 'curve'}
+            spread.append(f"{g(rs)}Ω→{g(target)}Ω: " + " · ".join(f"{k} ×{v:.3f}" for k, v in fs.items()))
+            worst = max(worst, max(fs.values()) / min(fs.values()))
+        if not spread:
+            return c_warn.configure(text="")
+        msg = "every model at this load — " + "   |   ".join(spread)
+        if worst > 1.05:
+            msg += (f"\nThe models disagree by {100 * (worst - 1):.0f}%, which is more than any "
+                    "tolerance you are grading against. Read the manual's power-vs-load diagram "
+                    "for this mode and use 'curve', or measure one setting at both loads on a "
+                    "known-good unit — do not guess.")
+        c_warn.configure(text=msg)
+        for i, (a, b) in enumerate(zip(S.rows, rows)):
+            if a['load_ohm'] == b['load_ohm'] and a['expected_W'] == b['expected_W']:
+                continue
+            la, ha = band_to('minmax', a['expected_W'], a['tol_pct'])
+            lb, hb = band_to('minmax', b['expected_W'], b['tol_pct'])
+            ctv.insert('', 'end', values=(
+                b['mode'], g(b['setting']), f"{la:.4g} – {ha:.4g} W @ {g(a['load_ohm'])}Ω",
+                f"{lb:.4g} – {hb:.4g} W @ {g(b['load_ohm'])}Ω",
+                f"{(b['expected_W'] / a['expected_W']) if a['expected_W'] else 1:.3f}"))
+
+    def cwrite():
+        picked = cpicked()
+        if not S.rows or not picked:
+            return messagebox.showinfo("Convert", "open a profile on tab 1 and pick the mode(s)")
+        mdl = S.cmodel.get()
+        try:
+            target = float(c_r.get())
+            curve = parse_curve(c_curve.get()) if mdl == 'curve' else None
+            rows = convert_rows(S.rows, picked, target, mdl, curve)
+        except (ValueError, ZeroDivisionError) as e:
+            return messagebox.showerror("Convert", str(e))
+        base = os.path.splitext(os.path.basename(S.path))[0] if S.path else (model.get() or 'machine')
+        p = filedialog.asksaveasfilename(
+            parent=root, title="Write converted profile", defaultextension='.csv',
+            initialdir=os.path.dirname(S.path) if S.path else prefs().get('profile_dir'),
+            initialfile=f"{profile_slug(base)}-{g(target)}ohm.csv",
+            filetypes=[("Machine profile", "*.csv")])
+        if not p:
+            return
+        # The note rides in the model column, so every report off this profile says it is derived.
+        note = (f"{model.get().strip() or base} [{'+'.join(picked)} spec restated at "
+                f"{g(target)}Ω, {mdl} model]")
+        try:
+            save_profile(p, note, rows)
+        except OSError as e:
+            return messagebox.showerror("Convert", f"could not write {p}\n\n{e}")
+        if messagebox.askyesno("Converted", f"{p}\n\nOpen it on tab 1 now?"):
+            S.rows, S.meas, S.cursor = rows, {}, None
+            model.delete(0, 'end'); model.insert(0, note)
+            setpath(p)
+            prender()
+            nb.select(pf)
+
+    c_modes.bind('<<ListboxSelect>>', lambda e: crender())
+    c_r.bind('<KeyRelease>', lambda e: crender())
+    c_curve.bind('<KeyRelease>', lambda e: crender())
+    ttk.Button(cf, text="Write converted profile…", command=cwrite).pack(anchor='e', padx=8, pady=(0, 8))
+    S.crefresh = crefresh
+
     def pump():
         try:
             while True:
@@ -2392,6 +2600,34 @@ def demo():
     assert setting_range(10, 120, 10) == [float(x) for x in range(10, 121, 10)]
     assert setting_range(0, 125, 10)[-2:] == [120.0, 125.0] and setting_range(0, 10, 1) == [float(x) for x in range(11)]
     assert setting_range(0, 1, 0.1)[-1] == 1.0 and len(setting_range(0, 1, 0.1)) == 11   # no float drift
+    # ---- restating a spec at a load the bench can actually build ----
+    assert load_factor('regulated', 75, 100) == 1.0
+    assert load_factor('voltage', 75, 100) == 0.75 and load_factor('current', 75, 100) == 100 / 75
+    assert abs(load_factor('matched', 75, 100) - 4 * 75 * 100 / 175 ** 2) < 1e-12
+    assert load_factor('matched', 75, 75) == 1.0 and load_factor('voltage', 75, 75) == 1.0
+    for _m in ('regulated', 'voltage', 'current'):    # these round trip both ways
+        assert abs(load_factor(_m, 75, 100) * load_factor(_m, 100, 75) - 1) < 1e-12, _m
+    # 'matched' deliberately does NOT round trip: each direction assumes the load the spec was
+    # written for IS the match point, so moving away from it derates whichever way you go.
+    assert load_factor('matched', 75, 100) == load_factor('matched', 100, 75) < 1.0
+    assert parse_curve('50:80, 75:100 100:95') == ([50.0, 75.0, 100.0], [80.0, 100.0, 95.0])
+    assert abs(load_factor('curve', 75, 100, parse_curve('50:80 75:100 100:95')) - 0.95) < 1e-12
+    assert abs(load_factor('curve', 50, 100, parse_curve('50:80 100:95')) - 95 / 80) < 1e-12
+    for _bad, _args in ((ValueError, ('curve', 75, 300, parse_curve('50:80 100:95'))),   # extrapolation
+                        (ValueError, ('voltage', 75, 0, None)),
+                        (ValueError, ('curve', 75, 100, None))):
+        try:
+            load_factor(*_args)
+        except _bad:
+            pass
+        else:
+            raise AssertionError(f"load_factor{_args} should have raised")
+    _src = [{'mode': 'bipolar', 'setting': 10.0, 'load_ohm': 75.0, 'expected_W': 10.0, 'tol_pct': 15.0},
+            {'mode': 'cut', 'setting': 10.0, 'load_ohm': 500.0, 'expected_W': 40.0, 'tol_pct': 15.0}]
+    _cv = convert_rows(_src, ['bipolar'], 100, 'voltage')
+    assert _cv[0]['load_ohm'] == 100 and _cv[0]['expected_W'] == 7.5 and _cv[0]['tol_pct'] == 15.0
+    assert _cv[1] == _src[1], "an unselected mode must come through untouched"
+    assert _src[0]['expected_W'] == 10.0, "convert_rows must not mutate the source rows"
     assert profile_slug('Ellman Dento-Surg 90 FFP') == 'ellman-dento-surg-90-ffp'
     # and the profile must survive the round trip to disk that the wizard's Save/Open does
     import tempfile
