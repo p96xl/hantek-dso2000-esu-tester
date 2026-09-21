@@ -263,8 +263,15 @@ Ellman Surgitron 4.0 Dual RF/120 IEC,fulg,50,500,87,20,1,Active -> right MONOPOL
 ```
 
 `envelope` and `wiring` are **optional** and both default to today's behaviour when absent, so
-every profile written before they existed still loads. `envelope` (`1`/`0`/blank) moves the
-"is this a modulated mode?" decision out of the tech's head and into the machine's own table;
+every profile written before they existed still loads.
+
+`envelope` (`1`/`0`/blank) moves the "is this a modulated mode?" decision out of the tech's head
+and into the machine's own table — **it is not auto-detection**, it is you reading the service
+manual once. A blank cell just falls back to the run tab's checkbox. The tool does check itself
+afterwards, though: a row captured `direct` whose own window turns out to straddle an envelope
+is flagged **⚠ MODULATED — re-read as envelope** rather than graded PASS or FAIL, because at
+that point the number is whatever the trigger landed on.
+
 `wiring` is free text the run banner shows, shouting **CHANGE THE LEADS** whenever it differs
 from the previous row.
 

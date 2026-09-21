@@ -525,10 +525,13 @@ def metrics(V, I, R, dt, freq=None):
     }
 
 
+SPREAD_MAX = 0.25       # RMS scatter across one capture above which it is not an average
+
+
 def warn_modulated(m):
     """Print a warning if this capture can't be trusted as an average-power reading.
     Modulated ESU modes (blend/coag/fulg) need a window spanning whole envelope periods."""
-    if m['BurstSpread'] > 0.25:
+    if m['BurstSpread'] > SPREAD_MAX:
         print(f"  WARNING: envelope varies {100 * m['BurstSpread']:.0f}% across this capture -- the "
               "window is shorter than the modulation period.\n"
               "           Vrms and power are whatever the trigger landed on, NOT average power. "
@@ -1063,7 +1066,9 @@ def tri(v):
     return None if not t else t in ('1', 'true', 'yes', 'y', 'on', 'env', 'envelope')
 
 
-ENVLBL = {None: 'auto', True: 'ENVELOPE', False: 'direct'}
+# Deliberately NOT called 'auto': nothing is auto-detected. A blank row defers to the run
+# tab's checkbox, and calling that 'auto' invites the tech to trust a detector that is not there.
+ENVLBL = {None: '(checkbox)', True: 'ENVELOPE', False: 'direct'}
 
 
 def app_dir():
@@ -1924,7 +1929,8 @@ def wizard():
     ttk.Label(setf, text="load Ω").grid(row=0, column=4, padx=(12, 2))
     e_l2 = ttk.Entry(setf, width=7); e_l2.grid(row=0, column=5)
     ttk.Label(setf, text="Envelope").grid(row=1, column=0, padx=4, pady=(0, 6))
-    e_env = ttk.Combobox(setf, width=7, state='readonly', values=('keep', 'auto', 'yes', 'no'))
+    e_env = ttk.Combobox(setf, width=10, state='readonly',
+                         values=('keep', 'checkbox', 'yes', 'no'))
     e_env.current(0); e_env.grid(row=1, column=1)
     ttk.Label(setf, text="wiring").grid(row=1, column=2, padx=(12, 2))
     e_wir = ttk.Entry(setf, width=60); e_wir.grid(row=1, column=3, columnspan=5, sticky='w')
@@ -1946,7 +1952,7 @@ def wizard():
             if ld:
                 r['load_ohm'] = float(ld)
             if e_env.get() != 'keep':
-                r['envelope'] = {'auto': None, 'yes': True, 'no': False}[e_env.get()]
+                r['envelope'] = {'checkbox': None, 'yes': True, 'no': False}[e_env.get()]
             if wir:
                 r['wiring'] = '' if wir == '-' else wir     # '-' clears it; blank keeps it
         prender()
@@ -2052,6 +2058,7 @@ def wizard():
     rtv.tag_configure('pass', background='#d8f5d8')
     rtv.tag_configure('fail', background='#f8d8d8')
     rtv.tag_configure('aim', background='#fff3c4')
+    rtv.tag_configure('susp', background='#ffe0b2')
     rtv.pack(fill='both', expand=True, padx=8)
 
     def row_env(r):
@@ -2081,6 +2088,12 @@ def wizard():
                 spec = bool(r['expected_W'])
                 vd = f"{'PASS' if ok else 'FAIL'}  ({dev:+.0f}%)" if spec else 'no spec'
                 w, tag = f"{w:.1f}", (('pass' if ok else 'fail') if spec else '')
+                # Not detection -- this is the post-mortem. A direct capture whose RMS moved
+                # this much across its own window measured one slice of an envelope, so the
+                # PASS/FAIL above is meaningless whichever way it fell. Say so instead of
+                # colouring it green.
+                if not row_env(r) and m.get('BurstSpread', 0) > SPREAD_MAX:
+                    vd, tag = "⚠ MODULATED — re-read as envelope", 'susp'
                 if i == aim:
                     tag = 'aim'
             rtv.insert('', 'end', iid=str(i), values=(r['mode'], g(r['setting']),
@@ -2777,6 +2790,16 @@ def demo():
         assert convert_rows(_b, ['bipolar'], 100.0, 'regulated')[0]['wiring'] == _b[0]['wiring']
         # A mode name is free text, so the table that prints it must MEASURE the column.
         # 'bipolar, effect 8' under a hardcoded :<9 pushed every later column off its header.
+        # The 'is this an envelope?' post-mortem: a CW capture must not trip it, a capture
+        # straddling an envelope must. Same threshold the printed warning uses.
+        # 4.013 MHz, NOT 4.000: at 50 kSa/s a 4.000 MHz carrier is an exact x80 and every
+        # sample lands on the same phase -- the coherent-sampling trap the README documents.
+        _cw = np.sin(2 * np.pi * 4.013e6 * ts)
+        _env = _cw * (0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 120 * ts)))
+        assert burst_spread(_cw) < SPREAD_MAX, burst_spread(_cw)
+        assert burst_spread(_env) > SPREAD_MAX, burst_spread(_env)
+        assert warn_modulated(metrics(_env, _env / 500, 500.0, ts[1] - ts[0])) is True
+        assert ENVLBL[None] != 'auto', 'a blank row defers to the checkbox, it is not detected'
         assert colw(['cut', 'bipolar, effect 8'], 9, 21) == 17
         assert colw(['cut', 'coag'], 9, 21) == 9, 'short names must not shrink the column'
         assert colw(['x' * 40], 9, 21) == 21 and clipw('x' * 40, 21) == 'x' * 20 + '\u2026'
