@@ -1,11 +1,71 @@
 # Hantek DSO2000 ESU Output Tester
 
-Automated RF **power / voltage / current** test reports from a **Hantek DSO2C50** (DSO2000 series)
-oscilloscope over SCPI/USBTMC — built for verifying electrosurgical unit (ESU) generator output
-into a rated resistive load. Captures both channels, computes power three ways, plots the waveform,
-and writes a printable HTML report. Ships a dead-simple GUI for bench techs.
+**Turns a general-purpose bench oscilloscope into an electrosurgical-generator output analyzer.**
 
-Measurement rig, as built and used here:
+An electrosurgical unit (ESU) is the generator behind the "bovie" pencil in almost every
+operating room — it cuts and cauterizes tissue with a few hundred watts of RF. Its dial says
+80 W. Hospital biomedical engineering has to periodically *prove* it still delivers 80 W into
+a rated load, and document it. That job normally needs a dedicated ESU analyzer, a
+single-purpose instrument that sits in a drawer between annual PMs.
+
+This does the same job with a $200-class two-channel scope, a current monitor and a high-voltage
+probe, driven over USB. It walks a technician through every mode and dial setting on the
+machine, grades each point against the manufacturer's own spec table, and writes a signed-off
+PDF report.
+
+![The wizard mid-run: green means key the pedal, the table grades each point as it lands](docs/wizard-run.png)
+
+*Mid-run. The banner is readable from across the bench — the generator is usually on a different
+table from the PC — and every row grades itself the moment the burst lands.*
+
+## Who this is for
+
+- **A biomed tech running the test.** Double-click an exe, open the machine's profile, follow the
+  colour: green = press the pedal, red = let go. No command line, no settings to remember.
+- **A biomed engineer who wants their own.** The whole rig is three parts and the wiring is
+  [documented below](#the-rig). The scope SCPI quirks are written down so you don't
+  rediscover them.
+- **An engineer reading the code.** One ~2,900-line Python file, standard library plus numpy and
+  matplotlib, no framework. `python esu_test.py --demo` self-tests the math with no hardware.
+
+## What it does
+
+1. **Build a machine profile once** — mode × dial setting × load × expected watts, transcribed
+   from the service manual into a CSV. Reused forever, shared over a network drive.
+2. **Arm.** The tool watches the current channel and detects the generator keying on its own.
+   Nobody counts down against a capture window.
+3. **The tech presses the pedal.** One burst is captured, scaled, and turned into real watts.
+4. **The point grades itself** — PASS/FAIL against the profile band, coloured, in the table.
+   A bad reading is one button away from being re-taken.
+5. **Save.** A PDF with the graded table and a measured-vs-spec chart, or the raw CSV.
+
+## The parts that were actually hard
+
+Honest engineering notes, each linked to the section that documents it:
+
+| Problem | What it turned out to be |
+|---|---|
+| Readings "bounced all over the place" on coag and blend | Only *cut* is continuous wave. The rest are a 4 MHz carrier under a ~120 Hz envelope, and a window sized to show the carrier is 1/500th of one envelope period — so you measure whichever slice the trigger landed on. Same simulated 45 W signal read 6 W, 177 W, or 0 W depending on trigger position. [The fix](#modulated-modes-blend--coag--fulg--read-this-before-trusting-a-number) is one long window and a plain `mean(v·i)`; the three obvious fixes all fail, and why is written down. |
+| The fire-detector armed at **12 kV** and nothing could trip it | A `:MEASure` query that times out is *not cancelled* — the scope still sends the reply, and the **next** query reads it instead of its own. One timeout poisons everything after it, across process boundaries. [Root cause and the four rules that came out of it](#when-the-scope-lies-about-a-measurement). |
+| The scope's own `VRMS` measurement | Returns a **frequency** on firmware 1.0.8. So does `FREQuency` at an envelope timebase, and the `MATH` V·I trace reads zero on live RF. All three are proven dead on the bench and none of them are used — every number is computed from the raw trace. |
+| Trusting any single power number | Every capture computes power three independent ways (`Vrms²/R`, `Irms²·R`, `mean(v·i)`). [When they agree the scaling is right; when they diverge, *which* pair diverges names the fault.](#the-trust-rule--read-the-three-power-numbers) |
+| The manual specifies 75 Ω and the bench has 100 Ω | You cannot just rescale — it depends on how that generator regulates. So the tool [asks which model applies](#tab-3--load-convert-oddball-spec-load--a-load-you-can-build), shows all of them side by side, and stamps the derivation into the report. It never quietly guesses. |
+
+## Status
+
+Used on real Ellman and ERBE generators. The envelope method is verified **in simulation** to
+0.0–1.6% on CW and modulated modes; the USB, detector and reporting paths are bench-verified
+on a DSO2C50 (firmware 1.0.8). `--demo` runs the whole math and reporting chain with no scope
+attached and is the regression test.
+
+MIT licensed. Not a certified medical device and not a substitute for one where a calibrated
+instrument is required — it is a bench tool that shows its work.
+
+---
+
+## The rig
+
+Three parts, as built and used here:
 
 | | Part | Notes |
 |---|---|---|
@@ -196,10 +256,17 @@ python esu_test.py --compare blend_sweep.csv                      # default: ell
 A name that doesn't exist lists what does, so a typo can't silently grade zero rows.
 
 ```csv
-model,mode,setting,load_ohm,expected_W,tol_pct
-Ellman Surgitron 4.0 Dual RF/120 IEC,cut,50,500,87,20
-Ellman Surgitron 4.0 Dual RF/120 IEC,bipolar,50,200,87,20      # note the 200 ohm
+model,mode,setting,load_ohm,expected_W,tol_pct,envelope,wiring
+Ellman Surgitron 4.0 Dual RF/120 IEC,cut,50,500,87,20,0,Active -> right MONOPOLAR jack; return -> REM jack
+Ellman Surgitron 4.0 Dual RF/120 IEC,bipolar,50,200,87,20,0,Both leads -> the two BIPOLAR jacks
+Ellman Surgitron 4.0 Dual RF/120 IEC,fulg,50,500,87,20,1,Active -> right MONOPOLAR jack; return -> REM jack
 ```
+
+`envelope` and `wiring` are **optional** and both default to today's behaviour when absent, so
+every profile written before they existed still loads. `envelope` (`1`/`0`/blank) moves the
+"is this a modulated mode?" decision out of the tech's head and into the machine's own table;
+`wiring` is free text the run banner shows, shouting **CHANGE THE LEADS** whenever it differs
+from the previous row.
 
 Format, how to add a machine, and the front-panel-vs-manual naming trap: **`refs/README.md`**.
 
@@ -363,7 +430,9 @@ Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expec
 - **ReRead selected** → clears that row, aims back at it, **and re-ranges the scope for it immediately**. Jump from setting 9 back to setting 2 and the vertical scale follows before you touch the footswitch, rather than staying on setting 9's range until the next burst.
 - **Re-run whole mode** → clears every row of that mode and starts it over.
 - **Force re-arm** → escape hatch if it thinks the pedal is still down when it isn't.
-- **Save results…** → a file dialog (remembers the last folder), default `<machine>_<sn>_results.pdf`: the graded table (spaced, gap between modes) with the measured-vs-spec chart after it — each mode its own marker shape, fill and line dash, so it reads on a black-and-white printout. Pick *CSV* in the type box for raw data instead.
+- **Save results…** → a file dialog (remembers the last folder), default `<machine>_<sn>_results.pdf`: the graded table (spaced, gap between modes) with the measured-vs-spec chart after it — each mode its own marker shape, fill and line dash, so it reads on a black-and-white printout. Pick *CSV* in the type box for raw data instead. The table's mode column is sized from the data,
+so a long name (`bipolar, effect 8`) shifts the header with it instead of sliding the numbers out
+from under it.
 
 ### Tab 3 — Load convert (oddball spec load → a load you can build)
 An ERBE 200S is specified into **75 Ω**. A series-bypass load bank with a hardwired 100 Ω base
