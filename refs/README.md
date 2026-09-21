@@ -26,6 +26,8 @@ Valleylab Force FX-C,cut,100,300,300,20
 | `load_ohm` | The load the OEM figure assumes. `--compare` warns if the logged load differs by >5%. |
 | `expected_W` | From the service manual's power-vs-setting figure. |
 | `tol_pct` | Per row, so you can tighten individual points. |
+| `envelope` | **Optional.** `1` = capture this row with the long-window envelope method (modulated modes: blend / coag / fulg), `0` = plain direct capture, **blank = ask the wizard's checkbox**. Fill it in and the tech never has to know which of *this* machine's modes are modulated. |
+| `wiring` | **Optional.** Free text, shown in big letters on the run banner, e.g. `Both leads -> the two BIPOLAR jacks` or `Active -> right MONOPOLAR jack; return -> REM jack`. The banner shouts **CHANGE THE LEADS** whenever it differs from the row above, so re-plugging is prompted, not remembered. |
 
 **Include a `setting,0` row at `0 W`** — it anchors the interpolation so low settings grade correctly.
 

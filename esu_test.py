@@ -929,14 +929,15 @@ def compare(args):
     # name the reference in the report -- grading a machine against another model's table
     # is the one failure mode here that produces a confident, wrong PASS.
     print(f"\n{args.compare}  vs  {args.ref}" + (f"  [{', '.join(sorted(models))}]" if models else ""))
-    print(f"{'mode':<10}{'set':>5}{'meas W':>9}{'spec W':>9}{'window':>17}{'dev':>8}   result")
+    mw = colw([r['mode'] for r in rows] + ['mode'], 10)
+    print(f"{'mode':<{mw}}{'set':>5}{'meas W':>9}{'spec W':>9}{'window':>17}{'dev':>8}   result")
     for r in sorted(rows, key=lambda x: (x['mode'], x['setting'])):
-        print(f"{r['mode']:<10}{r['setting']:>5.0f}{r['got']:>9.1f}{r['exp']:>9.1f}"
+        print(f"{r['mode']:<{mw}}{r['setting']:>5.0f}{r['got']:>9.1f}{r['exp']:>9.1f}"
               f"{r['lo']:>8.1f}-{r['hi']:<8.1f}{r['dev']:>+7.1f}%   {'PASS' if r['ok'] else 'FAIL'}"
               + (f"  [{r['method']}]" if r['method'] else "")
               + (f"  <-- repeats scattered {r['spread']:.0f}%, NOT trustworthy" if r['spread'] > 5 else ""))
         if abs(r['meas_load'] - r['load']) / r['load'] > 0.05:
-            print(f"{'':<10}  ^ load was {r['meas_load']:.0f} ohm, spec assumes {r['load']:.0f} ohm")
+            print(f"{'':<{mw}}  ^ load was {r['meas_load']:.0f} ohm, spec assumes {r['load']:.0f} ohm")
     npass = sum(r['ok'] for r in rows)
     print(f"\n{npass}/{len(rows)} within tolerance")
 
@@ -1050,7 +1051,19 @@ def session(args):
 
 
 # ---- machine profiles: refs/<machine>.csv, the same table --compare and --watch already read ----
-PROF_HDR = ['model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct']
+PROF_HDR = ['model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
+            'envelope', 'wiring']
+
+
+def tri(v):
+    """An OPTIONAL per-row flag. Blank or absent -> None, meaning "use the run tab's
+    checkbox" -- so every profile written before the column existed still loads and still
+    behaves exactly as it did."""
+    t = str('' if v is None else v).strip().lower()
+    return None if not t else t in ('1', 'true', 'yes', 'y', 'on', 'env', 'envelope')
+
+
+ENVLBL = {None: 'auto', True: 'ENVELOPE', False: 'direct'}
 
 
 def app_dir():
@@ -1110,7 +1123,8 @@ def profile_slug(name):
 
 
 def load_profile(path):
-    """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct}, ...]) sorted mode then setting."""
+    """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct, envelope, wiring}, ...])
+    sorted mode then setting. envelope/wiring are optional columns; see tri()."""
     import csv
     rows, model = [], ''
     with open(path, newline='', encoding='utf-8-sig') as f:
@@ -1120,7 +1134,8 @@ def load_profile(path):
             model = model or r.get('model', '')
             rows.append({'mode': r['mode'].strip().lower(), 'setting': float(r['setting']),
                          'load_ohm': float(r['load_ohm']), 'expected_W': float(r['expected_W']),
-                         'tol_pct': float(r['tol_pct'])})
+                         'tol_pct': float(r['tol_pct']), 'envelope': tri(r.get('envelope')),
+                         'wiring': (r.get('wiring') or '').strip()})
     rows.sort(key=lambda r: (r['mode'], r['setting']))
     return model, rows
 
@@ -1131,7 +1146,9 @@ def save_profile(path, model, rows):
         w = csv.writer(f); w.writerow(PROF_HDR)
         for r in rows:
             w.writerow([model, r['mode'], g(r['setting']), g(r['load_ohm']),
-                        g(r['expected_W']), g(r['tol_pct'])])
+                        g(r['expected_W']), g(r['tol_pct']),
+                        '' if r.get('envelope') is None else int(r['envelope']),
+                        r.get('wiring', '')])
     return path
 
 
@@ -1335,6 +1352,11 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
         base_scale = float(scope.query(f':CHANnel{ch}:SCALe?'))   # ONCE, before any :MEASure
     except Exception:
         base_scale = 0.0
+    try:
+        depth_direct = scope.query(':ACQuire:POINts?').strip()     # before any :MEASure, like above
+    except Exception:
+        depth_direct = None
+    was_env = False          # envelope leaves deep memory and a ~50 ms/div window behind
     freq_mode = str(args.fire_item).upper().startswith('FREQ')
     args._crest = getattr(args, '_crest', {})    # measured peak/rms per mode, feeds predict_vdiv
 
@@ -1469,7 +1491,18 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
                 print(f"  burst {n} DISCARDED: {e}")
                 n -= 1; settle(); rearm(); continue
             railed = False
+            was_env = True
         else:
+            if was_env:
+                # The previous point was an envelope point. envelope_power deliberately leaves
+                # the deep memory and the long window in place (re-arming them every burst
+                # costs ~0.6 s with the pedal down) -- so undo it HERE, the one place that
+                # actually needs a carrier-length window back.
+                was_env = False
+                if depth_direct:
+                    try: scope.write(f':ACQuire:POINts {depth_direct}')
+                    except Exception: pass
+                autoscale(scope, cycles=args.cycles)
             chans, dt = capture(scope, acq='NORMal', count=args.count)
             railed = clip_warn(scope, chans)
             V = chans[1] * PROBE_RATIO * args.vmult
@@ -1650,6 +1683,40 @@ def gui():
     root.mainloop()
 
 
+def colw(names, floor, cap=999):
+    """Width for the mode column. A mode name is FREE TEXT — 'bipolar, effect 8' is 17
+    characters — and a hardcoded width silently shifts every column to its right out from
+    under the header. Measure the data instead; `cap` is what still fits the paper."""
+    return max(floor, min(cap, max((len(str(n)) for n in names), default=0)))
+
+
+def clipw(s, w):
+    return s if len(s) <= w else s[:w - 1] + '\u2026'
+
+
+def results_csv(path, sn, model, rows, meas, env_default=False):
+    """The measured points as data — what the wizard writes when the tech picks CSV in the
+    save dialog's type box. One file or the other, never both: the PDF is the report. -> path"""
+    import csv
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['sn', 'model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
+                    'measured_W', 'pass', 'method', 'wiring',
+                    'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg'])
+        for i in sorted(meas):
+            r, m = rows[i], meas[i]
+            got = m['P_from_VxI (mean v*i)']
+            ok = verdict(got, r['expected_W'], r['tol_pct'])[0] if r['expected_W'] else ''
+            e = r.get('envelope')
+            w.writerow([sn, model, r['mode'], g(r['setting']), g(r['load_ohm']),
+                        g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
+                        'envelope' if (env_default if e is None else e) else 'direct',
+                        r.get('wiring', ''),
+                        round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
+                        round(m['Phase_deg'], 1)])
+    return path
+
+
 def results_pdf(path, sn, model, rows, meas):
     """Wizard results -> PDF: the graded table, then the measured-vs-spec chart (same drawing
     as --compare) on the same page when it fits. rows = profile rows,
@@ -1660,6 +1727,9 @@ def results_pdf(path, sn, model, rows, meas):
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.lines import Line2D
     curves, graded, lines = {}, [], []
+    # 21 is what is left of a 7.3 in text column at 9 pt monospace once the fixed columns
+    # below have taken their 75 characters. Longer names are clipped, not wrapped.
+    mw = colw([rows[i]['mode'] for i in sorted(meas)] + ['mode'], 9, 21)
     for r in rows:
         if r['expected_W']:
             curves.setdefault(r['mode'], []).append(
@@ -1674,10 +1744,10 @@ def results_pdf(path, sn, model, rows, meas):
             vd = f"{'PASS' if ok else 'FAIL'} {dev:+.1f}%"
         else:
             vd = 'no spec'
-        lines.append((r['mode'], f"{r['mode']:<9}{g(r['setting']):>4}  {lo:>6.4g} - {hi:<6.4g}{g(r['load_ohm']):>5}"
+        lines.append((r['mode'], f"{clipw(r['mode'], mw):<{mw}}{g(r['setting']):>4}  {lo:>6.4g} - {hi:<6.4g}{g(r['load_ohm']):>5}"
                      f"{got:>8.1f}  {vd:<12}{m['Vrms']:>7.1f}{m['Irms']:>7.3f}{m['Freq_Hz'] / 1e3:>7.0f}"
                      f"{m['Phase_deg']:>6.1f}"))
-    cols = (f"{'mode':<9}{'set':>4}  {'spec W':<15}{'load':>5}{'meas W':>8}  "
+    cols = (f"{'mode':<{mw}}{'set':>4}  {'spec W':<15}{'load':>5}{'meas W':>8}  "
             f"{'result':<12}{'Vrms':>7}{'Irms':>7}{'kHz':>7}{'phase':>6}")
     npass = sum(x['ok'] for x in graded)
     missing = len(rows) - len(meas)
@@ -1749,7 +1819,7 @@ def wizard():
     Stdlib tkinter/ttk only — no new dependency, ships inside the existing exe."""
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
-    import contextlib, csv, queue, threading, types
+    import contextlib, queue, threading, types
 
     S = types.SimpleNamespace(rows=[], meas={}, cursor=None, stop=True, thread=None, path='',
                               q=queue.Queue(), style=None, force=False, reaim=False,
@@ -1779,12 +1849,15 @@ def wizard():
     sty = ttk.Frame(pf); sty.pack(fill='x', padx=8, pady=2)
     ttk.Label(sty, text="Spec is written as:").pack(side='left')
 
-    ptv = ttk.Treeview(pf, columns=('mode', 'setting', 'load', 'a', 'b'),
+    ptv = ttk.Treeview(pf, columns=('mode', 'setting', 'load', 'a', 'b', 'env', 'wire'),
                        show='headings', height=13, selectmode='extended')
-    for c, w in (('mode', 130), ('setting', 80), ('load', 90), ('a', 130), ('b', 130)):
+    for c, w in (('mode', 110), ('setting', 70), ('load', 70), ('a', 100), ('b', 100),
+                 ('env', 80), ('wire', 300)):
         ptv.column(c, width=w, anchor='center')
+    ptv.column('wire', anchor='w')
     ptv.heading('mode', text='Mode'); ptv.heading('setting', text='Setting')
     ptv.heading('load', text='Load Ω')
+    ptv.heading('env', text='Envelope'); ptv.heading('wire', text='Wiring / leads')
     ptv.pack(fill='both', expand=True, padx=8, pady=6)
 
     def prender():
@@ -1798,7 +1871,8 @@ def wizard():
         for i, r in enumerate(S.rows):
             a, b = band_to(S.style.get(), r['expected_W'], r['tol_pct'])
             ptv.insert('', 'end', iid=str(i), values=(r['mode'], f"{g(r['setting'])}",
-                       f"{g(r['load_ohm'])}", f"{a:.4g}", f"{b:.4g}"))
+                       f"{g(r['load_ohm'])}", f"{a:.4g}", f"{b:.4g}",
+                       ENVLBL[r.get('envelope')], r.get('wiring', '')))
         ptv.selection_set([i for i in sel if i in ptv.get_children()])
         rsync()
         S.crefresh()
@@ -1833,13 +1907,15 @@ def wizard():
         for s in pts:
             if (name, s) not in have:
                 S.rows.append({'mode': name, 'setting': s, 'load_ohm': ld,
-                               'expected_W': 0.0, 'tol_pct': 0.0})
+                               'expected_W': 0.0, 'tol_pct': 0.0,
+                               'envelope': None, 'wiring': ''})
         S.rows.sort(key=lambda r: (r['mode'], r['setting']))
         prender()
 
     ttk.Button(addf, text="Add", command=add_mode).grid(row=0, column=10, padx=10)
 
-    setf = ttk.LabelFrame(pf, text="Set the spec for the selected row(s) — a blank field keeps that value")
+    setf = ttk.LabelFrame(pf, text="Set the spec for the selected row(s) — a blank field keeps that "
+                                   "value ('-' in wiring clears it)")
     setf.pack(fill='x', padx=8, pady=(0, 8))
     l_a = ttk.Label(setf, text="Min W"); l_a.grid(row=0, column=0, padx=4, pady=6)
     e_a = ttk.Entry(setf, width=9); e_a.grid(row=0, column=1)
@@ -1847,12 +1923,18 @@ def wizard():
     e_b = ttk.Entry(setf, width=9); e_b.grid(row=0, column=3)
     ttk.Label(setf, text="load Ω").grid(row=0, column=4, padx=(12, 2))
     e_l2 = ttk.Entry(setf, width=7); e_l2.grid(row=0, column=5)
+    ttk.Label(setf, text="Envelope").grid(row=1, column=0, padx=4, pady=(0, 6))
+    e_env = ttk.Combobox(setf, width=7, state='readonly', values=('keep', 'auto', 'yes', 'no'))
+    e_env.current(0); e_env.grid(row=1, column=1)
+    ttk.Label(setf, text="wiring").grid(row=1, column=2, padx=(12, 2))
+    e_wir = ttk.Entry(setf, width=60); e_wir.grid(row=1, column=3, columnspan=5, sticky='w')
 
     def apply_spec():
         sel = ptv.selection()
         if not sel:
             return messagebox.showinfo("Set spec", "select one or more rows first")
         st, a_in, b_in, ld = S.style.get(), e_a.get().strip(), e_b.get().strip(), e_l2.get().strip()
+        wir = e_wir.get().strip()
         try:
             [float(x) for x in (a_in, b_in, ld) if x]     # validate before touching any row
         except ValueError:
@@ -1863,6 +1945,10 @@ def wizard():
             r['expected_W'], r['tol_pct'] = band_from(st, a_in or a, b_in or b)
             if ld:
                 r['load_ohm'] = float(ld)
+            if e_env.get() != 'keep':
+                r['envelope'] = {'auto': None, 'yes': True, 'no': False}[e_env.get()]
+            if wir:
+                r['wiring'] = '' if wir == '-' else wir     # '-' clears it; blank keeps it
         prender()
 
     ttk.Button(setf, text="Apply", command=apply_spec).grid(row=0, column=6, padx=10)
@@ -1928,7 +2014,8 @@ def wizard():
         e = ttk.Entry(f1, width=w); e.insert(0, dflt); e.grid(row=0, column=2 * i + 1)
         fields[key] = e
     env = tk.BooleanVar(value=True)
-    ttk.Checkbutton(f1, text="Envelope (modulated modes)", variable=env).grid(row=0, column=10, padx=14)
+    ttk.Checkbutton(f1, text="Envelope when the profile says 'auto'",
+                    variable=env).grid(row=0, column=10, padx=14)
 
     # Colour, not wording, is what a tech reads from across the bench — the ESU is usually
     # on a different table from the PC. Green = key it, red = let go, blue = do not move.
@@ -1946,11 +2033,14 @@ def wizard():
                     bg=PHASE['idle'][0], fg='white')
     b_pt.pack()
     b_exp = tk.Label(ban, text="", font=("", 15), bg=PHASE['idle'][0], fg='#e8e8e8')
-    b_exp.pack(pady=(0, 12))
+    b_exp.pack()
+    b_wir = tk.Label(ban, text="", font=("", 17, "bold"), bg=PHASE['idle'][0], fg='#cfe8ff',
+                     wraplength=940, justify='center')
+    b_wir.pack(pady=(4, 12))
 
     def setphase(k):
         bg, txt = PHASE[k]
-        for w in (ban, b_act, b_pt, b_exp):
+        for w in (ban, b_act, b_pt, b_exp, b_wir):
             w.configure(bg=bg)
         b_act.configure(text=txt)
 
@@ -1963,6 +2053,13 @@ def wizard():
     rtv.tag_configure('fail', background='#f8d8d8')
     rtv.tag_configure('aim', background='#fff3c4')
     rtv.pack(fill='both', expand=True, padx=8)
+
+    def row_env(r):
+        """Envelope or direct for this row. The profile's own column decides; the checkbox is
+        only the fallback for rows (and old profiles) that leave it blank -- so the tech never
+        has to remember which of THIS machine's modes are modulated."""
+        e = r.get('envelope')
+        return bool(env.get()) if e is None else bool(e)
 
     def target():
         """Row the next burst lands on: an explicit ReRead pick, else the first unmeasured."""
@@ -1990,15 +2087,26 @@ def wizard():
                        f"{lo:.4g} – {hi:.4g} W @ {g(r['load_ohm'])}Ω", w, vd), tags=(tag,))
         # Text only — the colour is driven by the pedal phase, so the two never fight.
         if not S.rows:
-            b_pt.configure(text="— open a profile on tab 1 —"); b_exp.configure(text="")
+            b_pt.configure(text="— open a profile on tab 1 —")
+            b_exp.configure(text=""); b_wir.configure(text="")
         elif aim is None:
             b_pt.configure(text="ALL POINTS MEASURED")
             b_exp.configure(text="save the results, or select a row and hit ReRead")
+            b_wir.configure(text="")
         else:
             r = S.rows[aim]
             lo, hi = band_to('minmax', r['expected_W'], r['tol_pct'])
+            meth = 'envelope' if row_env(r) else 'direct'
             b_pt.configure(text=f"{r['mode'].upper()}   ·   LEVEL {g(r['setting'])}")
-            b_exp.configure(text=f"expect {lo:.4g} – {hi:.4g} W  into {g(r['load_ohm'])} Ω")
+            b_exp.configure(text=f"expect {lo:.4g} – {hi:.4g} W  into {g(r['load_ohm'])} Ω"
+                                 f"   ·   {meth} capture")
+            # The leads only matter when they CHANGE. Comparing against the row above is what
+            # turns a static note into the one thing the tech has to act on right now.
+            wir = (r.get('wiring') or '').strip()
+            prev = (S.rows[aim - 1].get('wiring') or '').strip() if aim else ''
+            chg = bool(wir) and wir != prev
+            b_wir.configure(text=(("⚠  CHANGE THE LEADS:  " if chg else "leads:  ") + wir) if wir else "",
+                            fg='#ffd24a' if chg else '#cfe8ff')
             rtv.see(str(aim))
 
     def reread():
@@ -2047,6 +2155,7 @@ def wizard():
                         r = S.rows[i]
                         args.mode, args.setpoint, args.load = r['mode'], g(r['setting']), r['load_ohm']
                         args.expect_w = r['expected_W']      # pre-range while the pedal is up
+                        args.envelope = row_env(r)           # the PROFILE decides, not the tech
                     S.q.put(('sync',))
 
                 def took_force():
@@ -2131,18 +2240,7 @@ def wizard():
             return
         try:
             if p.lower().endswith('.csv'):
-                with open(p, 'w', newline='', encoding='utf-8') as f:
-                    w = csv.writer(f)
-                    w.writerow(['sn', 'model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
-                                'measured_W', 'pass', 'Vrms', 'Irms', 'Freq_Hz', 'Phase_deg'])
-                    for i in sorted(S.meas):
-                        r, m = S.rows[i], S.meas[i]
-                        got = m['P_from_VxI (mean v*i)']
-                        ok = verdict(got, r['expected_W'], r['tol_pct'])[0] if r['expected_W'] else ''
-                        w.writerow([sn, model.get(), r['mode'], g(r['setting']), g(r['load_ohm']),
-                                    g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
-                                    round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
-                                    round(m['Phase_deg'], 1)])
+                results_csv(p, sn, model.get(), S.rows, dict(S.meas), bool(env.get()))
             else:
                 results_pdf(p, sn, model.get().strip() or name, S.rows, dict(S.meas))
         except (OSError, UnicodeError) as e:
@@ -2660,6 +2758,30 @@ def demo():
         with open(_np, 'w', newline='', encoding='utf-8-sig') as _f:
             _f.write('model,mode,setting,load_ohm,expected_W,tol_pct\nX,cut,1,500,10,20\n')
         assert load_profile(_np)[1][0]['mode'] == 'cut', 'a BOM must not break the header'
+        # ...and a profile written before the envelope/wiring columns existed must still say
+        # 'auto', i.e. defer to the run tab, rather than silently reading as 'direct'.
+        assert load_profile(_np)[1][0]['envelope'] is None, 'a missing column is auto, not off'
+        assert tri('') is None and tri(None) is None and tri(' ') is None
+        assert tri('1') is True and tri('YES') is True and tri('0') is False and tri('no') is False
+        # the per-row flag and the wiring note have to survive Save -> Open like everything else
+        _ep = os.path.join(td, 'env.csv')
+        save_profile(_ep, 'M', [
+            {'mode': 'bipolar', 'setting': 1.0, 'load_ohm': 75.0, 'expected_W': 10.0,
+             'tol_pct': 15.0, 'envelope': False, 'wiring': 'both leads -> BIPOLAR port'},
+            {'mode': 'coag', 'setting': 2.0, 'load_ohm': 500.0, 'expected_W': 20.0,
+             'tol_pct': 20.0, 'envelope': True, 'wiring': 'active -> MONOPOLAR (right), return -> REM'}])
+        _b = load_profile(_ep)[1]
+        assert [r['envelope'] for r in _b] == [False, True], [r['envelope'] for r in _b]
+        assert _b[0]['wiring'].endswith('BIPOLAR port') and 'REM' in _b[1]['wiring']
+        # and converting to another load must not drop either of them
+        assert convert_rows(_b, ['bipolar'], 100.0, 'regulated')[0]['wiring'] == _b[0]['wiring']
+        # A mode name is free text, so the table that prints it must MEASURE the column.
+        # 'bipolar, effect 8' under a hardcoded :<9 pushed every later column off its header.
+        assert colw(['cut', 'bipolar, effect 8'], 9, 21) == 17
+        assert colw(['cut', 'coag'], 9, 21) == 9, 'short names must not shrink the column'
+        assert colw(['x' * 40], 9, 21) == 21 and clipw('x' * 40, 21) == 'x' * 20 + '\u2026'
+        _hdr = f"{'mode':<{17}}{'set':>4}"
+        assert len(f"{clipw('bipolar, effect 8', 17):<{17}}{8:>4}") == len(_hdr)
         # wizard results PDF: one pass, one fail, one unmeasured-spec row
         mt = {'P_from_VxI (mean v*i)': 30.0, 'Vrms': 122.5, 'Irms': 0.245, 'Freq_Hz': 4e6, 'Phase_deg': 1.0}
         np_, ng = results_pdf(os.path.join(td, 'r.pdf'), 'SN1', 'Ellman', back,
@@ -2667,6 +2789,11 @@ def demo():
         assert (np_, ng) == (1, 2), (np_, ng)
         with open(os.path.join(td, 'r.pdf'), 'rb') as f:
             assert f.read(5) == b'%PDF-'
+        # the data the PDF was drawn from has to land as CSV too, header and rows in step
+        _rc = results_csv(os.path.join(td, 'r.csv'), 'SN1', 'Ellman', back, {1: mt})
+        _hd, _r1 = open(_rc, encoding='utf-8').read().strip().split('\n')
+        assert len(_hd.split(',')) == len(_r1.split(',')), (_hd, _r1)
+        assert _r1.split(',')[8] == 'True' and _r1.split(',')[9] == 'direct', _r1
     print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, "
           "snap125, clip/rail detection, session/verdict, min-max == +/- profile round trip")
 
