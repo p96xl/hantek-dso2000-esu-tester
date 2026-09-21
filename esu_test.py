@@ -528,6 +528,43 @@ def metrics(V, I, R, dt, freq=None):
 SPREAD_MAX = 0.25       # RMS scatter across one capture above which it is not an average
 
 
+def wants_burst(row, m):
+    """A profile row that is not finished: never read, read and FAILED, or read through a
+    window too short to have averaged anything. A green row is done."""
+    if m is None:
+        return True
+    return (modulated_miss(row, m) or
+            (bool(row['expected_W']) and not verdict(m['P_from_VxI (mean v*i)'],
+                                                     row['expected_W'], row['tol_pct'])[0]))
+
+
+def next_target(rows, meas, cursor=None, last=-1):
+    """Row the next burst lands on.
+
+    An explicit ReRead / Re-run pick (`cursor`) always wins -- that is how the tech says where
+    to start. Otherwise walk DOWN from `last`, the row the previous burst landed on: the next
+    row that still wants a burst, skipping the green ones. Starting a sweep halfway through a
+    machine therefore STAYS halfway through it instead of snapping back to row 0 after every
+    burst, which is what it used to do.
+
+    Only when nothing below wants one does it wrap, and the wrap looks for UNREAD rows only.
+    A point that is genuinely out of spec stays red and gets re-offered on the way down, but it
+    can never become the permanent target and trap the run on itself. -> index or None."""
+    if cursor is not None and cursor < len(rows):
+        return cursor
+    nxt = next((i for i in range(last + 1, len(rows)) if wants_burst(rows[i], meas.get(i))), None)
+    if nxt is not None:
+        return nxt
+    return next((i for i in range(len(rows)) if i not in meas), None)
+
+
+def modulated_miss(row, m):
+    """True when a point taken `direct` turns out to have straddled an envelope. The number is
+    then one slice of a burst, so whichever way its PASS/FAIL fell it means nothing -- the row
+    wants another burst, in envelope mode."""
+    return not row.get('envelope') and m.get('BurstSpread', 0) > SPREAD_MAX
+
+
 def warn_modulated(m):
     """Print a warning if this capture can't be trusted as an average-power reading.
     Modulated ESU modes (blend/coag/fulg) need a window spanning whole envelope periods."""
@@ -1821,7 +1858,7 @@ def wizard():
     from tkinter import ttk, messagebox, filedialog
     import contextlib, queue, threading, types
 
-    S = types.SimpleNamespace(rows=[], meas={}, cursor=None, stop=True, thread=None, path='',
+    S = types.SimpleNamespace(rows=[], meas={}, cursor=None, last=-1, stop=True, thread=None, path='',
                               q=queue.Queue(), style=None, force=False, reaim=False,
                               crefresh=lambda: None, cnames=[])
 
@@ -1928,6 +1965,7 @@ def wizard():
                                'expected_W': 0.0, 'tol_pct': 0.0,
                                'envelope': False, 'wiring': ''})
         S.rows.sort(key=lambda r: (r['mode'], r['setting']))
+        S.meas.clear(); S.cursor = None; S.last = -1     # the sort renumbers every row
         prender()
 
     ttk.Button(addf, text="Add", command=add_mode).grid(row=0, column=10, padx=10)
@@ -1969,7 +2007,7 @@ def wizard():
     def drop_rows():
         for iid in sorted((int(i) for i in ptv.selection()), reverse=True):
             del S.rows[iid]
-        S.meas.clear(); S.cursor = None
+        S.meas.clear(); S.cursor = None; S.last = -1
         prender()
 
     ttk.Button(setf, text="Delete selected", command=drop_rows).grid(row=0, column=7, padx=4)
@@ -1991,7 +2029,7 @@ def wizard():
             return messagebox.showerror("Open", f"not a machine profile:\n{p}\n\n{e}")
         if not rows:
             return messagebox.showerror("Open", f"profile is empty:\n{p}")
-        S.rows, S.meas, S.cursor = rows, {}, None
+        S.rows, S.meas, S.cursor, S.last = rows, {}, None, -1
         model.delete(0, 'end'); model.insert(0, mdl or os.path.splitext(os.path.basename(p))[0])
         setpath(p)
         prender()
@@ -2066,10 +2104,7 @@ def wizard():
     rtv.pack(fill='both', expand=True, padx=8)
 
     def target():
-        """Row the next burst lands on: an explicit ReRead pick, else the first unmeasured."""
-        if S.cursor is not None and S.cursor < len(S.rows):
-            return S.cursor
-        return next((i for i in range(len(S.rows)) if i not in S.meas), None)
+        return next_target(S.rows, S.meas, S.cursor, S.last)
 
     def rsync():
         rtv.delete(*rtv.get_children())
@@ -2089,7 +2124,7 @@ def wizard():
                 # this much across its own window measured one slice of an envelope, so the
                 # PASS/FAIL above is meaningless whichever way it fell. Say so instead of
                 # colouring it green.
-                if not r.get('envelope') and m.get('BurstSpread', 0) > SPREAD_MAX:
+                if modulated_miss(r, m):
                     vd, tag = "⚠ MODULATED — re-read as envelope", 'susp'
                 if i == aim:
                     tag = 'aim'
@@ -2195,6 +2230,7 @@ def wizard():
                         # it again. ponytail: a lock buys nothing a second click does not.
                         S.meas[i] = m
                         S.cursor = None
+                        S.last = i          # the next aim walks DOWN from here
                     aim()
             except Exception as e:
                 print(f"STOPPED: {e}")
@@ -2388,7 +2424,7 @@ def wizard():
         except (OSError, UnicodeError) as e:
             return messagebox.showerror("Convert", f"could not write {p}\n\n{e}")
         if messagebox.askyesno("Converted", f"{p}\n\nOpen it on tab 1 now?"):
-            S.rows, S.meas, S.cursor = rows, {}, None
+            S.rows, S.meas, S.cursor, S.last = rows, {}, None, -1
             model.delete(0, 'end'); model.insert(0, note)
             setpath(p)
             prender()
@@ -2782,6 +2818,28 @@ def demo():
         assert _b[0]['wiring'].endswith('BIPOLAR port') and 'REM' in _b[1]['wiring']
         # and converting to another load must not drop either of them
         assert convert_rows(_b, ['bipolar'], 100.0, 'regulated')[0]['wiring'] == _b[0]['wiring']
+        # Aiming: the run must walk DOWN from where it is, not snap back to row 0.
+        _rows = [{'mode': 'cut', 'setting': float(i), 'load_ohm': 500.0,
+                  'expected_W': 10.0, 'tol_pct': 10.0, 'envelope': False} for i in range(5)]
+        _ok, _bad = {'P_from_VxI (mean v*i)': 10.0}, {'P_from_VxI (mean v*i)': 99.0}
+        assert next_target(_rows, {}) == 0                       # fresh profile: the top
+        assert next_target(_rows, {}, cursor=3) == 3             # ReRead wins outright
+        # rows 0-2 green, just measured row 3 -> go to 4, NOT back to 0
+        _m = {0: _ok, 1: _ok, 2: _ok, 3: _ok}
+        assert next_target(_rows, _m, last=3) == 4
+        # start halfway: 0-1 unread, 2 green and just measured -> forward to 3, not back to 0
+        assert next_target(_rows, {2: _ok}, last=2) == 3
+        # a red row BELOW is a target; a green one is stepped over
+        assert next_target(_rows, {0: _ok, 1: _ok, 2: _ok, 3: _bad}, last=1) == 3
+        # ...but a red row cannot trap the run on itself: once it is behind, aim moves on
+        assert next_target(_rows, {0: _ok, 1: _ok, 2: _ok, 3: _bad}, last=3) == 4
+        # nothing left below -> wrap to UNREAD only, so a standing FAIL does not loop forever
+        assert next_target(_rows, {0: _bad, 1: _ok, 2: _ok, 3: _ok, 4: _ok}, last=4) is None
+        assert next_target(_rows, {1: _ok, 2: _ok, 3: _ok, 4: _ok}, last=4) == 0
+        # a direct point that straddled an envelope is not finished, whatever its verdict said
+        _mod = dict(_ok, BurstSpread=0.6)
+        assert wants_burst(_rows[0], _mod) is True
+        assert wants_burst(dict(_rows[0], envelope=True), _mod) is False
         # A mode name is free text, so the table that prints it must MEASURE the column.
         # 'bipolar, effect 8' under a hardcoded :<9 pushed every later column off its header.
         # The 'is this an envelope?' post-mortem: a CW capture must not trip it, a capture

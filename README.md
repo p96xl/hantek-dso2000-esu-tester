@@ -434,7 +434,8 @@ Fill S/N, coil turns, tap multiplier. Leave **Envelope** ticked for anything but
 
 Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expected band beneath it.
 
-- The row fills in with measured watts and **PASS/FAIL vs the profile**, green or red, and it aims at the next point on its own. A `direct` row that turns out to have straddled an envelope goes **amber, ⚠ MODULATED — re-read as envelope** instead of green or red — that number was one slice of a burst, so neither verdict would have meant anything.
+- The row fills in with measured watts and **PASS/FAIL vs the profile**, green or red, and it aims at the next point on its own — **downward from the point you just took**, never back to the top. Green rows are stepped over; unread and red ones are not. So to test only `cut`, ReRead its first row and it walks that mode instead of snapping back to row 0 after every burst.
+- Once nothing below wants a burst it wraps, and the **wrap looks for unread rows only**. A red row is re-offered on the way down, but a genuinely out-of-spec point can never become the permanent target and trap the run on itself. A `direct` row that turns out to have straddled an envelope goes **amber, ⚠ MODULATED — re-read as envelope** instead of green or red — that number was one slice of a burst, so neither verdict would have meant anything.
 - If the profile's `wiring` column is filled in, the banner carries it, and flips to **⚠ CHANGE THE LEADS** the moment it differs from the row above — so re-plugging bipolar → monopolar is prompted, not remembered.
 - **ReRead selected** → clears that row, aims back at it, **and re-ranges the scope for it immediately**. Jump from setting 9 back to setting 2 and the vertical scale follows before you touch the footswitch, rather than staying on setting 9's range until the next burst.
 - **Re-run whole mode** → clears every row of that mode and starts it over.
