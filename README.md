@@ -370,6 +370,20 @@ sample lands at the same phase), and repeatability is what catches it. Over 5% s
 reading. If it does, it's trustworthy on blend/coag on *your* bench — that's the argument that
 makes a report defensible.
 
+**The carrier hunt is a diagnostic, not a gate.** Before the long window, one 14 µs capture
+resolves the carrier — for the report line and for the coherent-sampling check. `mean(v·i)`
+does not use it. On a low-duty mode that peek lands *between* bursts most of the time (`fulg`
+at ~10% of a 2.5 ms period: one try hits 11%, so six tries miss outright **51%** of the time),
+and it used to throw the whole burst away with `never caught an in-burst carrier in 6 tries`.
+Two things now prevent that:
+
+- **A `direct` capture already resolves the carrier for free** — it sits on a carrier-length
+  window — so the first `direct` point of a run primes the cache and the envelope points never
+  hunt at all. The carrier is a property of the machine, not of the dial setting.
+- **Failing the hunt is no longer fatal.** It warns, measures, and reports the frequency as
+  unknown. *"Was the pedal actually down?"* is answered on the 50 ms window instead, where a
+  keyed ESU cannot read near zero at any setting — which is a far better test than a 14 µs peek.
+
 > ⚠️ **`:ACQuire:TYPE PEAK` is NOT honoured by fw 1.0.8.** An earlier version of this feature
 > assumed peak detect worked and reconstructed the envelope from it. The scope silently returned
 > ordinary decimated samples, so it read **exactly half** on CW (`mean(|V|·|I|)/2` where

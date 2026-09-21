@@ -741,8 +741,15 @@ def envelope_power(scope, args, repeats=3):
         print(f"  (retry {attempt + 1}: fast window saw {mf['Freq_Hz']:,.0f} Hz -- between bursts)")
     else:
         if not cached or args.recarrier:
-            raise RuntimeError("never caught an in-burst carrier in 6 tries -- is the ESU keying?")
-    if mf is not None:
+            # NOT fatal. `carrier` is a REPORTED value and the input to the coherent-sampling
+            # check; mean(v*i) -- the number this whole function exists to produce -- does not
+            # use it at all. A 14 us window misses a low-duty burst most of the time, so
+            # raising here discards a 50 ms average that would have been perfectly good.
+            # "Is the ESU keying?" is answered far better below, on the long window itself.
+            print("  (no carrier resolved in 6 fast windows -- normal on a low-duty mode. "
+                  "Measuring anyway; frequency will report as unknown)")
+            fresh_mf = False
+    if mf is not None and carrier == carrier:      # never cache a NaN -- it would stick all run
         args._carrier = (carrier, mf)
 
     # 2. LONG window. NORMal, never HRES -- HRES boxcar-averages the carrier to nothing.
@@ -787,11 +794,18 @@ def envelope_power(scope, args, repeats=3):
     Vf = chans[1] * PROBE_RATIO * args.vmult
     If = chans[2] / COIL_V_PER_A / args.turns
     m = metrics(Vf, If, args.load, dte)
+    if m['Vrms'] < 1.0:
+        # This replaces the fast-window hunt as the "was the pedal actually down?" test, and
+        # it is a much better one: 50 ms spans whole envelope periods, so a keyed ESU cannot
+        # read near zero here at any setting, and an unkeyed one cannot read anything else.
+        raise RuntimeError(f"nothing on CH1 across the whole {len(Vf) * dte * 1e3:.0f} ms "
+                           f"window (Vrms {m['Vrms']:.3g} V) -- the ESU was not keying")
     n3 = len(Vf) // 3                                     # thirds replace the 3 repeats
     Ps = np.array([float(np.mean(Vf[i*n3:(i+1)*n3] * If[i*n3:(i+1)*n3])) for i in range(3)])
     spread = float(Ps.std() / abs(Ps.mean())) if Ps.mean() else float('nan')
     m['Freq_Hz'] = carrier
-    print(f"  carrier {carrier:,.0f} Hz, {len(Vf) * dte * 1e3:.0f} ms record ({len(Vf)} pts) | thirds: "
+    print(f"  carrier {f'{carrier:,.0f} Hz' if carrier == carrier else 'UNKNOWN'}, "
+          f"{len(Vf) * dte * 1e3:.0f} ms record ({len(Vf)} pts) | thirds: "
           + " | ".join(f"{p:.1f}" for p in Ps) + f"  -> {m['P_from_VxI (mean v*i)']:.1f} W (spread {100 * spread:.1f}%)")
     if spread > 0.05:
         print("  WARNING: the thirds of this record disagree >5% -- the window is still shorter "
@@ -1560,6 +1574,19 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
         cf = m.get('CrestFactor')
         if cf and 1.0 < cf < 12:                # remember what THIS mode really looks like
             args._crest[str(args.mode)] = cf
+        # The carrier is a property of the MACHINE, and a direct capture sits on a
+        # carrier-length window, so it has already resolved one for free. Priming the cache
+        # here means the first ENVELOPE point does not have to hunt at all -- which matters
+        # because the hunt's 14 us peek lands in a gap ~90% of the time on a low-duty mode
+        # (fulg is ~10% of a 2.5 ms period: six tries miss outright half the time). Before
+        # the profile owned the flag, the run measured CW rows in envelope mode too and the
+        # cache was always primed by an easy one; now the first envelope row may BE the hard
+        # one. --recarrier still forces a fresh hunt.
+        f0 = m.get('Freq_Hz', 0.0)
+        if not args.envelope and 1e5 <= f0 <= 1e7 and not getattr(args, '_carrier', None):
+            args._carrier = (f0, m)
+            print(f"  carrier {f0:,.0f} Hz learned from this direct burst "
+                  f"(the envelope points will not have to hunt for it)")
         # The number that matters for the heatsink: how long the ESU was actually keyed.
         print(f"  burst window {time.time() - t_key:.1f} s")
         yield m, railed
@@ -1749,7 +1776,10 @@ def results_csv(path, sn, model, rows, meas):
                         g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
                         'envelope' if r.get('envelope') else 'direct',
                         r.get('wiring', ''),
-                        round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
+                        round(m['Vrms'], 1), round(m['Irms'], 4),
+                        # an unresolved carrier is NaN, and round(nan) raises -- a blank cell
+                        # is the honest answer and does not cost the tech the whole export
+                        round(m['Freq_Hz']) if m['Freq_Hz'] == m['Freq_Hz'] else '',
                         round(m['Phase_deg'], 1)])
     return path
 
@@ -2872,6 +2902,12 @@ def demo():
         _hd, _r1 = open(_rc, encoding='utf-8').read().strip().split('\n')
         assert len(_hd.split(',')) == len(_r1.split(',')), (_hd, _r1)
         assert _r1.split(',')[8] == 'True' and _r1.split(',')[9] == 'direct', _r1
+        # An unresolved carrier is NaN. round(nan) raises, which would have cost the tech
+        # the whole results export over a frequency nothing grades against.
+        _nanm = dict(mt, Freq_Hz=float('nan'))
+        _nc = results_csv(os.path.join(td, 'nan.csv'), 'SN1', 'M', back, {1: _nanm})
+        _hd, _r = open(_nc, encoding='utf-8').read().strip().split('\n')
+        assert len(_hd.split(',')) == len(_r.split(',')) and _r.split(',')[13] == '', _r
     print("demo OK — 20 W by all three methods, freq 4 kHz + fractional-bin 471 kHz, Vrms 100 V, "
           "snap125, clip/rail detection, session/verdict, min-max == +/- profile round trip")
 
