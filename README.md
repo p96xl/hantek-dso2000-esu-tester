@@ -265,12 +265,13 @@ Ellman Surgitron 4.0 Dual RF/120 IEC,fulg,50,500,87,20,1,Active -> right MONOPOL
 `envelope` and `wiring` are **optional** and both default to today's behaviour when absent, so
 every profile written before they existed still loads.
 
-`envelope` (`1`/`0`/blank) moves the "is this a modulated mode?" decision out of the tech's head
-and into the machine's own table — **it is not auto-detection**, it is you reading the service
-manual once. A blank cell just falls back to the run tab's checkbox. The tool does check itself
-afterwards, though: a row captured `direct` whose own window turns out to straddle an envelope
-is flagged **⚠ MODULATED — re-read as envelope** rather than graded PASS or FAIL, because at
-that point the number is whatever the trigger landed on.
+`envelope` (`1` or `0`) moves the "is this a modulated mode?" decision out of the tech's head and
+into the machine's own table — **it is not auto-detection**, it is you reading the service manual
+once, per machine. A mode is modulated or it isn't, so there is no third state and no runtime
+switch on the run tab to contradict the profile. The tool does check itself afterwards, though:
+a row captured `direct` whose own window turns out to straddle an envelope is flagged
+**⚠ MODULATED — re-read as envelope** rather than graded PASS or FAIL, because at that point the
+number is whatever the trigger landed on.
 
 `wiring` is free text the run banner shows, shouting **CHANGE THE LEADS** whenever it differs
 from the previous row.
@@ -433,7 +434,8 @@ Fill S/N, coil turns, tap multiplier. Leave **Envelope** ticked for anything but
 
 Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expected band beneath it.
 
-- The row fills in with measured watts and **PASS/FAIL vs the profile**, green or red, and it aims at the next point on its own.
+- The row fills in with measured watts and **PASS/FAIL vs the profile**, green or red, and it aims at the next point on its own. A `direct` row that turns out to have straddled an envelope goes **amber, ⚠ MODULATED — re-read as envelope** instead of green or red — that number was one slice of a burst, so neither verdict would have meant anything.
+- If the profile's `wiring` column is filled in, the banner carries it, and flips to **⚠ CHANGE THE LEADS** the moment it differs from the row above — so re-plugging bipolar → monopolar is prompted, not remembered.
 - **ReRead selected** → clears that row, aims back at it, **and re-ranges the scope for it immediately**. Jump from setting 9 back to setting 2 and the vertical scale follows before you touch the footswitch, rather than staying on setting 9's range until the next burst.
 - **Re-run whole mode** → clears every row of that mode and starts it over.
 - **Force re-arm** → escape hatch if it thinks the pedal is still down when it isn't.

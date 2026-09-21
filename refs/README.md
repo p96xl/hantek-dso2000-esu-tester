@@ -26,7 +26,7 @@ Valleylab Force FX-C,cut,100,300,300,20
 | `load_ohm` | The load the OEM figure assumes. `--compare` warns if the logged load differs by >5%. |
 | `expected_W` | From the service manual's power-vs-setting figure. |
 | `tol_pct` | Per row, so you can tighten individual points. |
-| `envelope` | **Optional.** `1` = capture this row with the long-window envelope method (modulated modes: blend / coag / fulg), `0` = plain direct capture, **blank = whatever the wizard's checkbox says**. Nothing is auto-detected — you are moving the decision out of the tech's head and into the table, once, from the service manual. What the tool *can* do is tell you afterwards: a `0` row whose capture turns out to straddle an envelope is flagged **⚠ MODULATED — re-read as envelope** instead of being graded. |
+| `envelope` | **Optional**, `1` or `0`. `1` = capture with the long-window envelope method (modulated modes: blend / coag / fulg); `0`, an empty cell, or no column at all = plain direct capture. A mode is one or the other — you set it once per machine off the service manual, and the wizard has no runtime switch to contradict it. Nothing is auto-detected, but a `0` row whose capture turns out to straddle an envelope is flagged **⚠ MODULATED — re-read as envelope** rather than graded. |
 | `wiring` | **Optional.** Free text, shown in big letters on the run banner, e.g. `Both leads -> the two BIPOLAR jacks` or `Active -> right MONOPOLAR jack; return -> REM jack`. The banner shouts **CHANGE THE LEADS** whenever it differs from the row above, so re-plugging is prompted, not remembered. |
 
 **Include a `setting,0` row at `0 W`** — it anchors the interpolation so low settings grade correctly.

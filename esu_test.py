@@ -1059,16 +1059,12 @@ PROF_HDR = ['model', 'mode', 'setting', 'load_ohm', 'expected_W', 'tol_pct',
 
 
 def tri(v):
-    """An OPTIONAL per-row flag. Blank or absent -> None, meaning "use the run tab's
-    checkbox" -- so every profile written before the column existed still loads and still
-    behaves exactly as it did."""
-    t = str('' if v is None else v).strip().lower()
-    return None if not t else t in ('1', 'true', 'yes', 'y', 'on', 'env', 'envelope')
-
-
-# Deliberately NOT called 'auto': nothing is auto-detected. A blank row defers to the run
-# tab's checkbox, and calling that 'auto' invites the tech to trust a detector that is not there.
-ENVLBL = {None: '(checkbox)', True: 'ENVELOPE', False: 'direct'}
+    """The per-row envelope flag. A mode is modulated or it is not, so this is a plain bool:
+    an absent column or an empty cell reads as 'direct'. A CW mode measured direct is correct,
+    and a modulated one measured direct gets caught by the BurstSpread flag on the run tab --
+    so the safe default is also the fast one."""
+    return str('' if v is None else v).strip().lower() in ('1', 'true', 'yes', 'y', 'on',
+                                                           'env', 'envelope')
 
 
 def app_dir():
@@ -1152,7 +1148,7 @@ def save_profile(path, model, rows):
         for r in rows:
             w.writerow([model, r['mode'], g(r['setting']), g(r['load_ohm']),
                         g(r['expected_W']), g(r['tol_pct']),
-                        '' if r.get('envelope') is None else int(r['envelope']),
+                        int(bool(r.get('envelope'))),
                         r.get('wiring', '')])
     return path
 
@@ -1699,7 +1695,7 @@ def clipw(s, w):
     return s if len(s) <= w else s[:w - 1] + '\u2026'
 
 
-def results_csv(path, sn, model, rows, meas, env_default=False):
+def results_csv(path, sn, model, rows, meas):
     """The measured points as data — what the wizard writes when the tech picks CSV in the
     save dialog's type box. One file or the other, never both: the PDF is the report. -> path"""
     import csv
@@ -1712,10 +1708,9 @@ def results_csv(path, sn, model, rows, meas, env_default=False):
             r, m = rows[i], meas[i]
             got = m['P_from_VxI (mean v*i)']
             ok = verdict(got, r['expected_W'], r['tol_pct'])[0] if r['expected_W'] else ''
-            e = r.get('envelope')
             w.writerow([sn, model, r['mode'], g(r['setting']), g(r['load_ohm']),
                         g(r['expected_W']), g(r['tol_pct']), round(got, 2), ok,
-                        'envelope' if (env_default if e is None else e) else 'direct',
+                        'envelope' if r.get('envelope') else 'direct',
                         r.get('wiring', ''),
                         round(m['Vrms'], 1), round(m['Irms'], 4), round(m['Freq_Hz']),
                         round(m['Phase_deg'], 1)])
@@ -1877,7 +1872,7 @@ def wizard():
             a, b = band_to(S.style.get(), r['expected_W'], r['tol_pct'])
             ptv.insert('', 'end', iid=str(i), values=(r['mode'], f"{g(r['setting'])}",
                        f"{g(r['load_ohm'])}", f"{a:.4g}", f"{b:.4g}",
-                       ENVLBL[r.get('envelope')], r.get('wiring', '')))
+                       'ENVELOPE' if r.get('envelope') else 'direct', r.get('wiring', '')))
         ptv.selection_set([i for i in sel if i in ptv.get_children()])
         rsync()
         S.crefresh()
@@ -1885,6 +1880,24 @@ def wizard():
     for txt, val in (("min – max   (Ellman)", 'minmax'), ("nominal ± %   (Valleylab)", 'pm')):
         ttk.Radiobutton(sty, text=txt, value=val, variable=S.style,
                         command=prender).pack(side='left', padx=8)
+
+    envf = ttk.Frame(pf); envf.pack(fill='x', padx=8)
+    ttk.Label(envf, text="Selected row(s) are:").pack(side='left')
+
+    def set_env(on):
+        sel = ptv.selection()
+        if not sel:
+            return messagebox.showinfo("Envelope", "select the row(s) first")
+        for iid in sel:
+            S.rows[int(iid)]['envelope'] = on
+        prender()
+
+    ttk.Button(envf, text="ENVELOPE  (modulated: blend / coag / fulg)",
+               command=lambda: set_env(True)).pack(side='left', padx=6)
+    ttk.Button(envf, text="direct  (CW: cut)",
+               command=lambda: set_env(False)).pack(side='left')
+    ttk.Label(envf, text="— a mode is one or the other; set it once per machine",
+              foreground='#666').pack(side='left', padx=10)
 
     addf = ttk.LabelFrame(pf, text="Add a mode")
     addf.pack(fill='x', padx=8, pady=4)
@@ -1913,7 +1926,7 @@ def wizard():
             if (name, s) not in have:
                 S.rows.append({'mode': name, 'setting': s, 'load_ohm': ld,
                                'expected_W': 0.0, 'tol_pct': 0.0,
-                               'envelope': None, 'wiring': ''})
+                               'envelope': False, 'wiring': ''})
         S.rows.sort(key=lambda r: (r['mode'], r['setting']))
         prender()
 
@@ -1928,12 +1941,8 @@ def wizard():
     e_b = ttk.Entry(setf, width=9); e_b.grid(row=0, column=3)
     ttk.Label(setf, text="load Ω").grid(row=0, column=4, padx=(12, 2))
     e_l2 = ttk.Entry(setf, width=7); e_l2.grid(row=0, column=5)
-    ttk.Label(setf, text="Envelope").grid(row=1, column=0, padx=4, pady=(0, 6))
-    e_env = ttk.Combobox(setf, width=10, state='readonly',
-                         values=('keep', 'checkbox', 'yes', 'no'))
-    e_env.current(0); e_env.grid(row=1, column=1)
-    ttk.Label(setf, text="wiring").grid(row=1, column=2, padx=(12, 2))
-    e_wir = ttk.Entry(setf, width=60); e_wir.grid(row=1, column=3, columnspan=5, sticky='w')
+    ttk.Label(setf, text="wiring").grid(row=1, column=0, padx=4, pady=(0, 6))
+    e_wir = ttk.Entry(setf, width=74); e_wir.grid(row=1, column=1, columnspan=7, sticky='w')
 
     def apply_spec():
         sel = ptv.selection()
@@ -1951,8 +1960,6 @@ def wizard():
             r['expected_W'], r['tol_pct'] = band_from(st, a_in or a, b_in or b)
             if ld:
                 r['load_ohm'] = float(ld)
-            if e_env.get() != 'keep':
-                r['envelope'] = {'checkbox': None, 'yes': True, 'no': False}[e_env.get()]
             if wir:
                 r['wiring'] = '' if wir == '-' else wir     # '-' clears it; blank keeps it
         prender()
@@ -2019,9 +2026,6 @@ def wizard():
         ttk.Label(f1, text=lbl).grid(row=0, column=2 * i, padx=(0 if i == 0 else 12, 4))
         e = ttk.Entry(f1, width=w); e.insert(0, dflt); e.grid(row=0, column=2 * i + 1)
         fields[key] = e
-    env = tk.BooleanVar(value=True)
-    ttk.Checkbutton(f1, text="Envelope when the profile says 'auto'",
-                    variable=env).grid(row=0, column=10, padx=14)
 
     # Colour, not wording, is what a tech reads from across the bench — the ESU is usually
     # on a different table from the PC. Green = key it, red = let go, blue = do not move.
@@ -2061,13 +2065,6 @@ def wizard():
     rtv.tag_configure('susp', background='#ffe0b2')
     rtv.pack(fill='both', expand=True, padx=8)
 
-    def row_env(r):
-        """Envelope or direct for this row. The profile's own column decides; the checkbox is
-        only the fallback for rows (and old profiles) that leave it blank -- so the tech never
-        has to remember which of THIS machine's modes are modulated."""
-        e = r.get('envelope')
-        return bool(env.get()) if e is None else bool(e)
-
     def target():
         """Row the next burst lands on: an explicit ReRead pick, else the first unmeasured."""
         if S.cursor is not None and S.cursor < len(S.rows):
@@ -2092,7 +2089,7 @@ def wizard():
                 # this much across its own window measured one slice of an envelope, so the
                 # PASS/FAIL above is meaningless whichever way it fell. Say so instead of
                 # colouring it green.
-                if not row_env(r) and m.get('BurstSpread', 0) > SPREAD_MAX:
+                if not r.get('envelope') and m.get('BurstSpread', 0) > SPREAD_MAX:
                     vd, tag = "⚠ MODULATED — re-read as envelope", 'susp'
                 if i == aim:
                     tag = 'aim'
@@ -2109,7 +2106,7 @@ def wizard():
         else:
             r = S.rows[aim]
             lo, hi = band_to('minmax', r['expected_W'], r['tol_pct'])
-            meth = 'envelope' if row_env(r) else 'direct'
+            meth = 'envelope' if r.get('envelope') else 'direct'
             b_pt.configure(text=f"{r['mode'].upper()}   ·   LEVEL {g(r['setting'])}")
             b_exp.configure(text=f"expect {lo:.4g} – {hi:.4g} W  into {g(r['load_ohm'])} Ω"
                                  f"   ·   {meth} capture")
@@ -2168,7 +2165,7 @@ def wizard():
                         r = S.rows[i]
                         args.mode, args.setpoint, args.load = r['mode'], g(r['setting']), r['load_ohm']
                         args.expect_w = r['expected_W']      # pre-range while the pedal is up
-                        args.envelope = row_env(r)           # the PROFILE decides, not the tech
+                        args.envelope = bool(r.get('envelope'))    # the PROFILE decides, not the tech
                     S.q.put(('sync',))
 
                 def took_force():
@@ -2222,7 +2219,6 @@ def wizard():
             args.vmult = float(fields['vmult'].get() or 1.0)
             args.fire_ch = int(fields['fire_ch'].get() or 2)
             args.headroom = int(fields['headroom'].get() or 0)
-            args.envelope = bool(env.get())
             args.acq = 'NORMal'
         except ValueError:
             return messagebox.showerror("Start", "turns / mult / channel must be numbers")
@@ -2253,7 +2249,7 @@ def wizard():
             return
         try:
             if p.lower().endswith('.csv'):
-                results_csv(p, sn, model.get(), S.rows, dict(S.meas), bool(env.get()))
+                results_csv(p, sn, model.get(), S.rows, dict(S.meas))
             else:
                 results_pdf(p, sn, model.get().strip() or name, S.rows, dict(S.meas))
         except (OSError, UnicodeError) as e:
@@ -2773,9 +2769,7 @@ def demo():
         assert load_profile(_np)[1][0]['mode'] == 'cut', 'a BOM must not break the header'
         # ...and a profile written before the envelope/wiring columns existed must still say
         # 'auto', i.e. defer to the run tab, rather than silently reading as 'direct'.
-        assert load_profile(_np)[1][0]['envelope'] is None, 'a missing column is auto, not off'
-        assert tri('') is None and tri(None) is None and tri(' ') is None
-        assert tri('1') is True and tri('YES') is True and tri('0') is False and tri('no') is False
+        assert load_profile(_np)[1][0]['envelope'] is False, 'a missing column reads as direct'
         # the per-row flag and the wiring note have to survive Save -> Open like everything else
         _ep = os.path.join(td, 'env.csv')
         save_profile(_ep, 'M', [
@@ -2799,7 +2793,10 @@ def demo():
         assert burst_spread(_cw) < SPREAD_MAX, burst_spread(_cw)
         assert burst_spread(_env) > SPREAD_MAX, burst_spread(_env)
         assert warn_modulated(metrics(_env, _env / 500, 500.0, ts[1] - ts[0])) is True
-        assert ENVLBL[None] != 'auto', 'a blank row defers to the checkbox, it is not detected'
+        # The flag is a BOOL. A missing column, a blank cell and an unset row are all
+        # 'direct' -- there is no third state for a tech to have to reason about.
+        assert tri('') is False and tri(None) is False and tri('0') is False
+        assert tri('1') is True and tri('YES') is True and tri('envelope') is True
         assert colw(['cut', 'bipolar, effect 8'], 9, 21) == 17
         assert colw(['cut', 'coag'], 9, 21) == 9, 'short names must not shrink the column'
         assert colw(['x' * 40], 9, 21) == 21 and clipw('x' * 40, 21) == 'x' * 20 + '\u2026'
