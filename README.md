@@ -375,14 +375,18 @@ resolves the carrier — for the report line and for the coherent-sampling check
 does not use it. On a low-duty mode that peek lands *between* bursts most of the time (`fulg`
 at ~10% of a 2.5 ms period: one try hits 11%, so six tries miss outright **51%** of the time),
 and it used to throw the whole burst away with `never caught an in-burst carrier in 6 tries`.
-Two things now prevent that:
+Three things now prevent that:
 
 - **A `direct` capture already resolves the carrier for free** — it sits on a carrier-length
   window — so the first `direct` point of a run primes the cache and the envelope points never
   hunt at all. The carrier is a property of the machine, not of the dial setting.
 - **Failing the hunt is no longer fatal.** It warns, measures, and reports the frequency as
-  unknown. *"Was the pedal actually down?"* is answered on the 50 ms window instead, where a
-  keyed ESU cannot read near zero at any setting — which is a far better test than a 14 µs peek.
+  unknown. *"Was the pedal actually down?"* is answered on the long window instead, where a
+  keyed ESU cannot read near zero at any setting — a far better test than a 14 µs peek.
+- **A failed hunt is remembered for the run.** It fails for a reason that cannot change
+  mid-run — the mode's duty cycle — so re-paying six captures on every burst to re-learn "no"
+  was pure cost. Three tries, once, then never again (`--recarrier` forces a fresh hunt). That
+  is most of the difference between a ~17 s burst and a ~7 s one.
 
 > ⚠️ **`:ACQuire:TYPE PEAK` is NOT honoured by fw 1.0.8.** An earlier version of this feature
 > assumed peak detect worked and reconstructed the envelope from it. The scope silently returned
@@ -603,6 +607,16 @@ close it and build again. The script now says so explicitly.
   at 4K — the sample rate does not drop, the record just gets 10× longer, which is exactly
   what a modulated mode needs. Millions of points really are minutes over USB; `--envdepth`
   defaults to 40000. (`400000` silently reads back as `40000` in 2-channel mode.)
+- ⚠ **`:ACQuire:POINts` is a PICKER, not a number.** A value that is not on the list is
+  silently ignored and the scope stays where it was — no error, no change in the readback.
+  That cost real measurements: `--envdepth` was defaulted to **10000**, which is not on the
+  list, so the scope ignored it on every burst — while the code re-asked and slept 0.6 s for
+  the write to settle, every burst, forever — and captured at **4000** throughout. An 80 ms
+  record is **9.6** mains periods at 60 Hz, not a whole number, which is exactly what fires
+  the thirds-disagree warning. 800 ms (40000) is 96 periods at 60 Hz **and** 80 at 50 Hz.
+  Out-of-list values are now snapped to the nearest real depth, and say so.
+  *(The numbers in the bullet above were right the whole time — the code drifted away from
+  them on 2026-09-10 and nothing caught it, because none of that push was bench-verified.)*
 - Power `mean(v·i)` is noise-immune; `Irms²·R` is not — if they disagree, suspect load drift or reactance.
 - The vendor SCPI manual (`DSO2000 Series SCPI Programmers Manual.pdf`) is on
   [hantek.com](https://www.hantek.com/) → product downloads. Not redistributed here.
