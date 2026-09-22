@@ -437,6 +437,45 @@ out 50.6 / 50.6 / 50.4 Ω against a 50 Ω profile — constant to 0.4% while the
 35 to 26 Ω. The load was right, the power was right, and the voltage path had something in it.
 - Clean voltage + near-zero current → the current loop is **open** (or both conductors pass through the coil and cancel).
 
+## Why low settings read high (and take longer)
+
+`Vrms = sqrt(mean(V²))`, so anything that isn't signal adds **in quadrature**. The scope's own
+noise floor is a fixed number of ADC codes whatever the range, so the less of the ADC the signal
+uses, the more it inflates every rms-derived number — and `Vrms²/R` and `Irms²·R` are squared,
+so they inflate twice as fast:
+
+| peak codes used | Vrms high by | `Vrms²/R` high by |
+|---|---|---|
+| 75 (correctly ranged) | 0.1% | 0.1% |
+| 40 | 0.2% | 0.5% |
+| 20 | 1.0% | 2.0% |
+| 10 | 3.9% | 8.0% |
+| 5 | 14.8% | 31.8% |
+
+*(assuming a ~2-code RMS floor — `--calcheck` measures yours.)*
+
+**Three things pushed low settings into that column, all now fixed:**
+
+- **`clip_warn` was one-sided.** It caught *too sensitive* (railed, reads low) and *past the
+  screen edge but valid*, and said nothing at all about *too coarse* — the one that reads
+  **high** and is otherwise silent. It now reports peak codes used and the resulting inflation.
+- **The crest hint's bias was backwards.** `predict_vdiv` ranges the first burst of a mode from
+  `--crest-hint`, and the two ways to be wrong are **not symmetric**: guess too low and the
+  frame rails, which `clip_warn` catches and re-ranges on the spot; guess too high and the range
+  is silently too coarse. The old default 3.5 "split the difference" between cut (1.41) and fulg
+  (4–6) — which put every CW-ish mode's first burst at ~25 of 127 codes. Now **2.0**, erring
+  toward the self-correcting side.
+- **DC was never removed.** An ESU delivers no DC and a Pearson coil *cannot pass* DC, so any
+  DC in the trace is scope baseline error — but `mean(v·i)` gained `Vdc·Idc` **outright**. That
+  is a fixed watt offset: invisible at 100 W, a real error at 10 W, on the exact number the
+  wizard grades against. Now subtracted, and reported as `P_dc_removed` so a suspect reading can
+  be traced rather than re-argued.
+
+**Why it also takes longer:** a mis-ranged first burst is a railed first burst, and railing costs
+an autoscale plus a re-capture. Both are per-mode, not per-setting — the second burst of a mode
+is ranged from the crest that mode actually measured — but a sweep that walks upward from the
+bottom spends them at its low settings.
+
 ## Finding the right load
 ESU power peaks at a rated load and rolls off both sides (too low = current-limited, too high = voltage-limited).
 Sweep `--load` and watch `P (mean v·i)` climb toward the dial; the peak is the mode's rated impedance.

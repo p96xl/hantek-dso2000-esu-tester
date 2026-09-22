@@ -94,6 +94,19 @@ def clip_warn(scope, chans, targets=(1, 2)):
         elif top > 4 * CODES_PER_DIV:
             print(f"  (CH{ch} runs {top / (4 * CODES_PER_DIV):.2f}x past the SCREEN edge but is not "
                   f"saturated — peak {top:.0f} of {ADC_RAIL} codes. This reading is VALID.)")
+        elif top < CODES_PER_DIV:
+            # The MIRROR of saturation, and the reason this branch exists: too sensitive rails
+            # and is caught above; too COARSE is silent. Vrms is sqrt(mean(V^2)), so the
+            # scope's own noise floor (~2 codes rms) adds IN QUADRATURE, and with little
+            # signal to swamp it every rms-derived number reads HIGH. It bites hardest at low
+            # settings, which is exactly where the crest hint is least likely to be right.
+            infl = (1 + (2.0 / max(top / 1.41, 1e-9)) ** 2) ** 0.5 - 1
+            print(f"  !! CH{ch} UNDER-RANGED — peak only {top:.0f} of {ADC_RAIL} codes "
+                  f"({top / CODES_PER_DIV:.1f} of 8 div at {scale:g} V/div). Vrms reads ~"
+                  f"{infl:.0%} HIGH and Vrms^2/R ~{(1 + infl) ** 2 - 1:.0%} high — the noise "
+                  f"floor adds in quadrature and there is little signal to swamp it.")
+            print(f"     The next burst of this mode is ranged from the crest it just measured, "
+                  f"so ReRead this point and it will be right.")
     return bad
 
 
@@ -512,6 +525,14 @@ def metrics(V, I, R, dt, freq=None):
     """V, I already in real volts/amps. Returns the measurement + 3 power estimates.
     freq: if given (e.g. the scope's own counter), used verbatim; else computed from the trace."""
     import numpy as np
+    V = np.asarray(V, float); I = np.asarray(I, float)
+    # An ESU delivers no DC, and a Pearson coil CANNOT pass DC -- its core would have to hold
+    # a steady flux. So any DC here is scope baseline error, and every number below is
+    # quadratic or bilinear in it: Vrms^2 gains Vdc^2, and mean(v*i) gains Vdc*Idc OUTRIGHT.
+    # That last one is a fixed watt offset, invisible at 100 W and a real error at 10 W --
+    # and mean(v*i) is the number the wizard grades on.
+    vdc, idc = float(np.mean(V)), float(np.mean(I))
+    V = V - vdc; I = I - idc
     Vrms = float(np.sqrt(np.mean(V**2))); Irms = float(np.sqrt(np.mean(I**2)))
     Vpk = float(np.max(np.abs(V)))
     return {
@@ -527,6 +548,8 @@ def metrics(V, I, R, dt, freq=None):
         'Phase_deg': float(np.degrees(np.arccos(
             np.clip(np.mean(V * I) / (Vrms * Irms), -1, 1)))) if Vrms and Irms else float('nan'),
         'BurstSpread': burst_spread(V),
+        # kept so a suspicious reading can be traced back to its baseline, not re-argued
+        'Vdc': vdc, 'Idc': idc, 'P_dc_removed': vdc * idc,
     }
 
 
@@ -2959,6 +2982,18 @@ def demo():
         _hd, _r1 = open(_rc, encoding='utf-8').read().strip().split('\n')
         assert len(_hd.split(',')) == len(_r1.split(',')), (_hd, _r1)
         assert _r1.split(',')[8] == 'True' and _r1.split(',')[9] == 'direct', _r1
+        # DC is not physical here (a Pearson coil cannot pass it), and mean(v*i) gains
+        # Vdc*Idc OUTRIGHT -- a fixed watt offset that is invisible at 100 W and a real
+        # error at 10 W, on the very number the wizard grades against.
+        _tq = np.arange(0, 2e-3, 1 / 20e6)
+        _Vq = np.sqrt(2) * 70.7 * np.sin(2 * np.pi * 350e3 * _tq)
+        _Iq = _Vq / 500.0
+        _clean = metrics(_Vq, _Iq, 500.0, 1 / 20e6)
+        _off = metrics(_Vq + 12.0, _Iq + 0.02, 500.0, 1 / 20e6)      # 12 V and 20 mA of baseline
+        assert abs(_clean['P_from_VxI (mean v*i)'] - 10.0) < 0.05, _clean['P_from_VxI (mean v*i)']
+        assert abs(_off['P_from_VxI (mean v*i)'] - 10.0) < 0.05, 'DC must not reach the power'
+        assert abs(_off['P_dc_removed'] - 0.24) < 0.01, _off['P_dc_removed']
+        assert abs(_off['Vdc'] - 12.0) < 0.1 and abs(_off['Idc'] - 0.02) < 1e-4
         # A V-I phase angle splits the three power numbers by cos(phi). Resolving |Z| into
         # its real and reactive parts is what turns that split from noise into a diagnosis:
         # 50 ohm REAL + reactance means the load is right and the RIG has something in it.
@@ -3012,7 +3047,7 @@ def make_parser():
     ap.add_argument('--fire-ch', type=int, default=2, help='channel the fire-detector watches (default 2 = the Pearson current channel, the only quiet one)')
     ap.add_argument('--headroom', type=int, default=2, metavar='STEPS', help='--watch: back CH1/CH2 off this many 1-2-5 range steps after each burst, so walking a dial UP never clips the next reading on screen. Each measurement re-ranges, so it does not accumulate. 0 = off')
     ap.add_argument('--expect-w', type=float, default=0.0, metavar='W', dest='expect_w', help='watts this next burst is expected to produce. Both channels are then ranged for it with the pedal UP, and the keyed window is just the capture — no measure/step/re-measure. --watch fills this from the --ref table automatically; the wizard fills it from the profile')
-    ap.add_argument('--crest-hint', type=float, default=3.5, metavar='X', help='peak/rms assumed when pre-ranging the FIRST burst of a mode from its expected watts (cut is 1.41, coag/fulg 4-6; 3.5 splits it). Every burst after uses the crest that mode actually measured')
+    ap.add_argument('--crest-hint', type=float, default=2.0, metavar='X', help='peak/rms assumed when pre-ranging the FIRST burst of a mode from its expected watts (cut 1.41, soft coag ~1.8, fulg 4-6). NOT the midpoint, on purpose: the two ways to be wrong are not symmetric. Guess too LOW and the frame rails, which clip_warn catches and re-ranges on the spot. Guess too HIGH and the range is silently too coarse, which inflates every rms number and nothing notices. 2.0 errs toward the self-correcting side. Every burst after the first uses the crest that mode actually measured')
     ap.add_argument('--fire-item', default='FREQuency', metavar='ITEM', help='what the fire-detector reads: FREQuency (default — an idle channel measures no frequency at all, so there is no baseline, threshold or range to get wrong) or VPP (the older level-based path, kept as a fallback)')
     ap.add_argument('--fire-min-hz', type=float, default=100.0, metavar='HZ', help='--fire-item FREQuency: a reading above this is a fire. Only there to reject a stale VPP reply (volts) leaking into the queue; keyed readings are kilohertz')
     ap.add_argument('--fire-gain', type=float, default=4.0, metavar='X', help='fire-detect trips at this multiple of the MEDIAN idle reading (default 4). Derived entirely from measured idle — no scope range query, which is what desyncs this firmware')
