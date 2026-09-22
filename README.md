@@ -414,6 +414,27 @@ Every report computes power three independent ways: `Vrms²/R`, `Irms²·R`, and
 one channel is mis-scaled and the divergence tells you which:
 - `Irms²·R` way off, others low → **CH1 voltage probe ratio wrong** (e.g. a ×10 probe left on ×1 → voltage reads 10× low). Fix it on the scope; the tool trusts the scope's own probe ratio.
 - `Vrms²/R` vs `Irms²·R` disagree → the load `R` isn't its nominal value (heating/drift) or there's reactance.
+
+**The tool now does this reading for you.** When the three split by more than 15% it resolves the
+measured impedance into its parts and names the cause, because a rig fault written down as a
+machine fault is the expensive kind of mistake:
+
+```
+  !! the three power numbers DISAGREE: Vrms^2/R=36.2  Irms^2*R=23.8  v*i=24.1 W
+     V and I are 35 deg apart, so this is not the pure resistance the spec assumes:
+     |Z| 61.6 ohm = 50.6 REAL + 35.1 reactive   (profile says 50 ohm)
+     The REAL part matches the profile -- which is why Irms^2*R and v*i agree, and why
+     24.1 W is the power. Vrms^2/R reads high only because Vrms also counts the volts
+     across the reactance.
+     Look at the RIG, not the machine: HV probe compensation at this carrier, and
+     lead/load inductance.
+```
+
+`Vrms²/R` assumes every measured volt sits across `R`; `mean(v·i)` and `Irms²·R` do not. So a
+V–I phase angle splits them by exactly `cos φ`, and **which** number is the odd one out says
+where to look. Real case (ERBE 200S soft coag, three consecutive settings): the real part came
+out 50.6 / 50.6 / 50.4 Ω against a 50 Ω profile — constant to 0.4% while the reactance fell from
+35 to 26 Ω. The load was right, the power was right, and the voltage path had something in it.
 - Clean voltage + near-zero current → the current loop is **open** (or both conductors pass through the coil and cancel).
 
 ## Finding the right load

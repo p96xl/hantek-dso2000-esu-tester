@@ -582,6 +582,40 @@ def warn_modulated(m):
     return False
 
 
+def warn_disagree(m, R):
+    """The three power numbers agreeing IS the trust rule. When they split, say which way and
+    what it means -- printing three numbers and hoping the tech remembers the README is how a
+    rig fault gets written down as a machine fault.
+
+    `Vrms^2/R` assumes every measured volt sits across R. `mean(v*i)` and `Irms^2*R` do not.
+    So a V-I phase angle splits them by exactly cos(phi), and the split is DIAGNOSTIC: resolve
+    the measured impedance into its real and reactive parts and the cause names itself."""
+    import math
+    pv, pi = m['P_from_V (Vrms^2/R)'], m['P_from_I (Irms^2*R)']
+    pvi = m['P_from_VxI (mean v*i)']
+    if not pvi or not m['Irms'] or max(abs(pv - pvi), abs(pi - pvi)) / abs(pvi) < 0.15:
+        return False
+    va = m['Vrms'] * m['Irms']
+    pf = pvi / va if va else 0.0
+    z = m['Vrms'] / m['Irms']
+    r_re, x = z * pf, z * math.sqrt(max(0.0, 1.0 - pf * pf))
+    print(f"  !! the three power numbers DISAGREE: Vrms^2/R={pv:.1f}  Irms^2*R={pi:.1f}  "
+          f"v*i={pvi:.1f} W")
+    print(f"     V and I are {m['Phase_deg']:.0f} deg apart, so this is not the pure resistance "
+          f"the spec assumes:")
+    print(f"     |Z| {z:.1f} ohm = {r_re:.1f} REAL + {x:.1f} reactive   (profile says {R:g} ohm)")
+    if abs(r_re - R) / R < 0.1:
+        print(f"     The REAL part matches the profile -- which is why Irms^2*R and v*i agree, "
+              f"and why {pvi:.1f} W is the power. Vrms^2/R reads high only because Vrms also "
+              f"counts the volts across the reactance.")
+        print("     Look at the RIG, not the machine: HV probe compensation at this carrier, "
+              "and lead/load inductance.")
+    else:
+        print(f"     The REAL part is {r_re:.1f} ohm, not {R:g}. Grade against the load you "
+              f"actually have, or find why it moved (heating? wrong tap?).")
+    return True
+
+
 def plot(t, V, I, path, smooth=0):
     import matplotlib
     matplotlib.use('Agg')
@@ -1593,6 +1627,7 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
         if args.math:
             print(f"  scope MATH VAVG={scope_meas(scope, 'VAVG', 'MATH')}  (diagnostic; proven dead on fw 1.0.8)")
         warn_modulated(m)
+        warn_disagree(m, args.load)
         cf = m.get('CrestFactor')
         if cf and 1.0 < cf < 12:                # remember what THIS mode really looks like
             args._crest[str(args.mode)] = cf
@@ -2924,6 +2959,22 @@ def demo():
         _hd, _r1 = open(_rc, encoding='utf-8').read().strip().split('\n')
         assert len(_hd.split(',')) == len(_r1.split(',')), (_hd, _r1)
         assert _r1.split(',')[8] == 'True' and _r1.split(',')[9] == 'direct', _r1
+        # A V-I phase angle splits the three power numbers by cos(phi). Resolving |Z| into
+        # its real and reactive parts is what turns that split from noise into a diagnosis:
+        # 50 ohm REAL + reactance means the load is right and the RIG has something in it.
+        _f, _sr = 350e3, 20e6
+        _t = np.arange(0, 2e-3, 1 / _sr)
+        _Vp = np.sqrt(2) * 61.6 * 0.690 * np.sin(2 * np.pi * _f * _t)          # |Z| 61.6 ohm
+        _Ip = np.sqrt(2) * 0.690 * np.sin(2 * np.pi * _f * _t - np.radians(35))
+        _md = metrics(_Vp, _Ip, 50.0, 1 / _sr)
+        assert abs(_md['Phase_deg'] - 35) < 1, _md['Phase_deg']
+        _z = _md['Vrms'] / _md['Irms']
+        _pf = _md['P_from_VxI (mean v*i)'] / (_md['Vrms'] * _md['Irms'])
+        assert abs(_z * _pf - 50.5) < 1.0, _z * _pf              # the REAL part is the load
+        assert warn_disagree(_md, 50.0) is True
+        # ...and an in-phase pair on the same load must stay quiet
+        _Ir = np.sqrt(2) * (61.6 * 0.690 / 50.0) * np.sin(2 * np.pi * _f * _t)
+        assert warn_disagree(metrics(_Vp, _Ir, 50.0, 1 / _sr), 50.0) is False
         # :ACQuire:POINts is a picker. Asking for a depth that is not on it changes nothing,
         # so --envdepth 10000 measured at 4000 (an 80 ms record) while claiming 200 ms.
         assert min(DEPTHS, key=lambda d: abs(d - 10000)) == 4000
