@@ -41,6 +41,11 @@ ADC_RAIL = 127         # signed-int8 saturation. MEASURED, and it is NOT the scr
 
 BLOCK = 2000           # samples are interleaved in 2000-byte per-channel blocks
 VDIV, HDIV = 8, 14     # DSO2000 grid: 8 vertical, 14 horizontal divisions
+# :ACQuire:POINts is a PICKER, not a number. Anything else is silently ignored and the scope
+# stays where it was -- which is how --envdepth 10000 spent weeks asking for a depth that does
+# not exist, sleeping 0.6 s for the write to settle, and measuring at 4000 the whole time.
+# 400000 reads back as 40000 in 2-channel mode, so these two are the real choices.
+DEPTHS = (4000, 40000)
 
 
 def _snap125(x, lo, hi, up=True):
@@ -725,7 +730,13 @@ def envelope_power(scope, args, repeats=3):
             scope.write(f':TIMebase:SCALe {_snap125(args.envwin / HDIV, 2e-9, 50):g}')
             time.sleep(0.3)
             range_by_vpp(scope)
-    for attempt in range(0 if cached and not args.recarrier else 6):
+    # A hunt that failed once on this machine will fail again for the same reason -- the
+    # mode's duty cycle -- so it is remembered for the run. Paying 6 captures a burst, every
+    # burst, to re-learn "no" is where the 30 s bursts came from. 3 tries, not 6: on a CW mode
+    # the first one hits, and on a 10%-duty one the 4th/5th/6th only add 3% to the odds.
+    give_up = getattr(args, '_nocarrier', False)
+    tries = 0 if (cached or give_up) and not args.recarrier else 3
+    for attempt in range(tries):
         scope.write(f':TIMebase:SCALe {_snap125(1e-6, 2e-9, 50, up=False):g}')
         time.sleep(0.2)
         if not args.no_autoscale and not getattr(args, '_ranged', False):
@@ -740,15 +751,17 @@ def envelope_power(scope, args, repeats=3):
             break
         print(f"  (retry {attempt + 1}: fast window saw {mf['Freq_Hz']:,.0f} Hz -- between bursts)")
     else:
-        if not cached or args.recarrier:
+        if tries:
             # NOT fatal. `carrier` is a REPORTED value and the input to the coherent-sampling
             # check; mean(v*i) -- the number this whole function exists to produce -- does not
             # use it at all. A 14 us window misses a low-duty burst most of the time, so
-            # raising here discards a 50 ms average that would have been perfectly good.
+            # raising here discards a long average that would have been perfectly good.
             # "Is the ESU keying?" is answered far better below, on the long window itself.
-            print("  (no carrier resolved in 6 fast windows -- normal on a low-duty mode. "
-                  "Measuring anyway; frequency will report as unknown)")
-            fresh_mf = False
+            args._nocarrier = True
+            print(f"  (no carrier in {tries} fast windows — normal on a low-duty mode: a 14 us "
+                  "peek lands between bursts. NOT retried again this run; frequency reports as "
+                  "unknown. --recarrier forces a fresh hunt)")
+        fresh_mf = False
     if mf is not None and carrier == carrier:      # never cache a NaN -- it would stick all run
         args._carrier = (carrier, mf)
 
@@ -779,8 +792,12 @@ def envelope_power(scope, args, repeats=3):
         prev_depth = scope.query(':ACQuire:POINts?').strip()
     except Exception:
         pass
-    if prev_depth and prev_depth != str(args.envdepth):
-        scope.write(f':ACQuire:POINts {int(args.envdepth)}')
+    want_depth = min(DEPTHS, key=lambda d: abs(d - int(args.envdepth)))
+    if want_depth != int(args.envdepth):
+        print(f"  (memory depth {args.envdepth} is not selectable on this scope — using {want_depth})")
+        args.envdepth = want_depth
+    if prev_depth and prev_depth != str(want_depth):
+        scope.write(f':ACQuire:POINts {want_depth}')
         time.sleep(0.6)
     chans, dte = capture(scope, acq='NORMal', count=args.count)
     if clip_warn(scope, chans):
@@ -1530,7 +1547,12 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
         n += 1
         ph('capture')
         t_key = time.time()
-        hold = "~10 s on the first burst, ~6 s after" if args.envelope else "~5 s"
+        if not args.envelope:
+            hold = "~5 s"
+        elif getattr(args, '_carrier', None) or getattr(args, '_nocarrier', False):
+            hold = "~7 s"
+        else:
+            hold = "~13 s — this one hunts the carrier, the rest are ~7 s"
         print(f"--- BURST {n} detected --- capturing (keep it keyed {hold})")
         if args.envelope:
             # Long-window mean(v*i) -- the only honest average for a MODULATED mode.
@@ -1584,7 +1606,7 @@ def fire_loop(scope, args, stop=None, phase=None, force=None, retarget=None):
         # one. --recarrier still forces a fresh hunt.
         f0 = m.get('Freq_Hz', 0.0)
         if not args.envelope and 1e5 <= f0 <= 1e7 and not getattr(args, '_carrier', None):
-            args._carrier = (f0, m)
+            args._carrier, args._nocarrier = (f0, m), False
             print(f"  carrier {f0:,.0f} Hz learned from this direct burst "
                   f"(the envelope points will not have to hunt for it)")
         # The number that matters for the heatsink: how long the ESU was actually keyed.
@@ -2902,6 +2924,14 @@ def demo():
         _hd, _r1 = open(_rc, encoding='utf-8').read().strip().split('\n')
         assert len(_hd.split(',')) == len(_r1.split(',')), (_hd, _r1)
         assert _r1.split(',')[8] == 'True' and _r1.split(',')[9] == 'direct', _r1
+        # :ACQuire:POINts is a picker. Asking for a depth that is not on it changes nothing,
+        # so --envdepth 10000 measured at 4000 (an 80 ms record) while claiming 200 ms.
+        assert min(DEPTHS, key=lambda d: abs(d - 10000)) == 4000
+        assert min(DEPTHS, key=lambda d: abs(d - 40000)) == 40000
+        # 800 ms is the point of the 40000 default: whole mains periods at BOTH line
+        # frequencies, which is what stops the thirds of the record disagreeing.
+        assert abs((0.800 * 120) % 1) < 1e-9 and abs((0.800 * 100) % 1) < 1e-9
+        assert abs((0.080 * 120) % 1) > 0.1, '80 ms is 9.6 periods at 60 Hz -- the partial one'
         # An unresolved carrier is NaN. round(nan) raises, which would have cost the tech
         # the whole results export over a frequency nothing grades against.
         _nanm = dict(mt, Freq_Hz=float('nan'))
@@ -2921,7 +2951,7 @@ def make_parser():
     ap.add_argument('--gui', action='store_true', help='the old one-shot capture+report window')
     ap.add_argument('--session', nargs='*', metavar='NAME', help='power-sweep: connect+autoscale once, capture on each Enter, log to <NAME>_sweep.csv. Words are joined: --session ellman 1234 cut -> ellman_1234_cut_sweep.csv')
     ap.add_argument('--envelope', action='store_true', help='measure a MODULATED mode (blend/coag/fulg) with a long-window mean(v*i); run on cut first to validate. COMBINE WITH --watch for fire-detected envelope bursts')
-    ap.add_argument('--envdepth', type=int, default=10000, help='memory depth for envelope captures. 10000 = a 200 ms record in ~2.9 s — the default. 200 ms is exactly 12 mains periods at 60 Hz AND 10 at 50 Hz, so the record holds a WHOLE number of envelope periods either way and there is no partial-period error (120 ms does not, and reads 1.5%% high on half-wave coag). Raise to 20000/40000 only if the thirds-disagree warning fires')
+    ap.add_argument('--envdepth', type=int, default=40000, help='memory depth for envelope captures — a PICKER, not a number; anything else is silently ignored by the scope. 40000 = an 800 ms record in ~5.4 s, the default: 800 ms is exactly 96 mains periods at 60 Hz AND 80 at 50 Hz, so the record holds a WHOLE number of envelope periods either way and there is no partial-period error. 4000 = an 80 ms record in ~2.3 s — 3 s faster per burst, but 9.6 periods at 60 Hz, which is what makes the thirds-disagree warning fire on half-wave coag')
     ap.add_argument('--recarrier', action='store_true', help='re-measure the carrier at every envelope point instead of reusing the first (the carrier is a property of the machine, not the dial setting)')
     ap.add_argument('--envwin', type=float, default=50e-3, metavar='SEC', help='envelope averaging window in seconds (default 0.05 = 3 cycles of a 60 Hz envelope)')
     ap.add_argument('--compare', metavar='SWEEP.CSV', help='score a saved session against --ref and chart it (no scope needed)')
