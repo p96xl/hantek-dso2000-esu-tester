@@ -30,7 +30,7 @@ Valleylab Force FX-C,cut,100,300,300,20
 | `envelope` | **Optional**, `1` or `0`. `1` = capture with the long-window envelope method (modulated modes: blend / coag / fulg); `0`, an empty cell, or no column at all = plain direct capture. A mode is one or the other — you set it once per machine off the service manual, and the wizard has no runtime switch to contradict it. Nothing is auto-detected, but a `0` row whose capture turns out to straddle an envelope is flagged **⚠ MODULATED — re-read as envelope** rather than graded. |
 | `wiring` | **Optional.** Free text, shown in big letters on the run banner, e.g. `Both leads -> the two BIPOLAR jacks` or `Active -> right MONOPOLAR jack; return -> REM jack`. The banner shouts **CHANGE THE LEADS** whenever it differs from the row above, so re-plugging is prompted, not remembered. |
 
-Starter files, one of each style, same (made-up) machine: [`examples/example-minmax.csv`](examples/example-minmax.csv) and [`examples/example-pct.csv`](examples/example-pct.csv). Copy one, rename it, replace the numbers.
+Starter files, one of each style, same (made-up) machine: [`examples/example-minmax.csv`](examples/example-minmax.csv) and [`examples/example-pct.csv`](examples/example-pct.csv). Copy one, rename it, replace the numbers. [`examples/example-report.pdf`](examples/example-report.pdf) is what the wizard hands back for that profile (made-up readings, one deliberate FAIL; the setting-0 anchor rows are not fired, hence "4 not measured").
 
 **Include a `setting,0` row at `0 W`** — it anchors the interpolation so low settings grade correctly.
 

@@ -19,6 +19,7 @@ build_log.txt
 
 # vendor manual — not redistributed (get it from hantek.com)
 *.pdf
+!refs/examples/example-report.pdf
 
 # bench photos / scope screenshots
 *.jpg

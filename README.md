@@ -18,6 +18,8 @@ PDF report.
 *Mid-run. The banner is readable from across the bench — the generator is usually on a different
 table from the PC — and every row grades itself the moment the burst lands.*
 
+What it hands back: [a sample report](refs/examples/example-report.pdf) (made-up machine, made-up readings) — every mode on one chart.
+
 ## Who this is for
 
 - **A biomed tech running the test.** Double-click an exe, open the machine's profile, follow the
@@ -521,6 +523,10 @@ Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expec
 - **Save results…** → a file dialog (remembers the last folder), default `<machine>_<sn>_results.pdf`: the graded table (spaced, gap between modes) with the measured-vs-spec chart after it — each mode its own marker shape, fill and line dash, so it reads on a black-and-white printout. Pick *CSV* in the type box for raw data instead. The table's mode column is sized from the data,
 so a long name (`bipolar, effect 8`) shifts the header with it instead of sliding the numbers out
 from under it.
+
+  ![Sample report, page 2: four modes, 38 points, one chart, the one FAIL marked with an X](refs/examples/example-report%202%20of%202.png)
+
+  *[Sample report](refs/examples/example-report.pdf) off [`example-minmax.csv`](refs/examples/example-minmax.csv) — page 1 is [the table](refs/examples/example-report%201%20of%202.png). Readings are made up; coag 70 fails on purpose.*
 
 ### Tab 3 — Load convert (oddball spec load → a load you can build)
 An ERBE 200S is specified into **75 Ω**. A series-bypass load bank with a hardwired 100 Ω base
