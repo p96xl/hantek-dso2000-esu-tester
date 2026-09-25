@@ -1,0 +1,11 @@
+model,mode,setting,load_ohm,expected_W,tol_pct,envelope,wiring
+Example ESU (made-up numbers),cut,0,500,0,20,0,Active -> MONOPOLAR jack; return -> REM jack
+Example ESU (made-up numbers),cut,25,500,25,20,0,
+Example ESU (made-up numbers),cut,50,500,50,20,0,
+Example ESU (made-up numbers),cut,100,500,100,20,0,
+Example ESU (made-up numbers),coag,0,500,0,20,1,
+Example ESU (made-up numbers),coag,25,500,25,20,1,
+Example ESU (made-up numbers),coag,50,500,50,20,1,
+Example ESU (made-up numbers),bipolar,0,100,0,20,0,Both leads -> the two BIPOLAR jacks
+Example ESU (made-up numbers),bipolar,10,100,10,20,0,
+Example ESU (made-up numbers),bipolar,20,100,20,20,0,

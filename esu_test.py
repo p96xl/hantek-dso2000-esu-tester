@@ -978,7 +978,8 @@ def draw_vs_spec(ax, curves, rows):
 def compare(args):
     """Score a saved session against an OEM reference table and chart it.
 
-    Reference CSV columns: mode,setting,load_ohm,expected_W,tol_pct (+ optional model).
+    Reference CSV columns: mode,setting,load_ohm,expected_W,tol_pct (+ optional model),
+    or min_W,max_W in place of expected_W,tol_pct -- see csv_band().
     Point it at any machine's table with --ref; the default is only a convenience.
 
     The OEM table is a CURVE, so expected_W is INTERPOLATED between tabulated settings --
@@ -1008,7 +1009,7 @@ def compare(args):
     with open(args.ref, newline='', encoding='utf-8-sig') as f:
         for r in csv.DictReader(f):
             curves.setdefault(r['mode'].strip().lower(), []).append(
-                (float(r['setting']), float(r['expected_W']), float(r['tol_pct']), float(r['load_ohm'])))
+                (float(r['setting']), *csv_band(r), float(r['load_ohm'])))
             if r.get('model'):
                 models.add(r['model'].strip())
     for c in curves.values():
@@ -1243,36 +1244,54 @@ def band_to(style, expected_W, tol_pct):
     return expected_W, tol_pct
 
 
+def csv_band(r):
+    """A CSV row's band as (expected_W, tol_pct). A profile states it either way: min_W,max_W
+    (what a tech typing an Excel template from the manual's "17-25 W" has) or expected_W,tol_pct."""
+    if (r.get('min_W') or '').strip():
+        return band_from('minmax', r['min_W'], r['max_W'])
+    return float(r['expected_W']), float(r['tol_pct'])
+
+
 def profile_slug(name):
     import re
     return re.sub(r'[^a-z0-9]+', '-', str(name).lower()).strip('-') or 'machine'
 
 
 def load_profile(path):
-    """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct, envelope, wiring}, ...])
-    sorted mode then setting. envelope/wiring are optional columns; see tri()."""
+    """-> (model, [{mode, setting, load_ohm, expected_W, tol_pct, envelope, wiring}, ...], style)
+    sorted mode then setting. style is 'minmax' if the file states min_W,max_W, else 'pm' --
+    so Save writes it back the way it came. envelope/wiring are optional columns; see tri()."""
     import csv
     rows, model = [], ''
     with open(path, newline='', encoding='utf-8-sig') as f:
-        for r in csv.DictReader(f):
+        rd = csv.DictReader(f)
+        style = 'minmax' if 'min_W' in (rd.fieldnames or []) else 'pm'
+        for r in rd:
             if not (r.get('mode') or '').strip():
                 continue                 # Excel loves to leave trailing all-comma rows
             model = model or r.get('model', '')
+            e, t = csv_band(r)
             rows.append({'mode': r['mode'].strip().lower(), 'setting': float(r['setting']),
-                         'load_ohm': float(r['load_ohm']), 'expected_W': float(r['expected_W']),
-                         'tol_pct': float(r['tol_pct']), 'envelope': tri(r.get('envelope')),
+                         'load_ohm': float(r['load_ohm']), 'expected_W': e,
+                         'tol_pct': t, 'envelope': tri(r.get('envelope')),
                          'wiring': (r.get('wiring') or '').strip()})
     rows.sort(key=lambda r: (r['mode'], r['setting']))
-    return model, rows
+    return model, rows, style
 
 
-def save_profile(path, model, rows):
+def save_profile(path, model, rows, style='pm'):
+    """style 'minmax' writes min_W,max_W in place of expected_W,tol_pct -- same band either way."""
     import csv
+    hdr = PROF_HDR if style != 'minmax' else [
+        {'expected_W': 'min_W', 'tol_pct': 'max_W'}.get(h, h) for h in PROF_HDR]
     with open(path, 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f); w.writerow(PROF_HDR)
+        w = csv.writer(f); w.writerow(hdr)
         for r in rows:
+            a, b = band_to(style, r['expected_W'], r['tol_pct'])
+            if style == 'minmax':        # 24.999999999 -> 25; the % form is written unrounded
+                a, b = round(a, 6), round(b, 6)
             w.writerow([model, r['mode'], g(r['setting']), g(r['load_ohm']),
-                        g(r['expected_W']), g(r['tol_pct']),
+                        g(a), g(b),
                         int(bool(r.get('envelope'))),
                         r.get('wiring', '')])
     return path
@@ -1382,7 +1401,7 @@ def ref_bands(ref):
         for r in csv.DictReader(f):
             if not (r.get('mode') or '').strip():
                 continue
-            e, t = float(r['expected_W']), float(r['tol_pct'])
+            e, t = csv_band(r)
             out.setdefault(r['mode'].strip().lower(), []).append(
                 (float(r['setting']), e * (1 - t / 100), e * (1 + t / 100)))
     for v in out.values():
@@ -2134,12 +2153,13 @@ def wizard():
         if not p:
             return
         try:
-            mdl, rows = load_profile(p)
+            mdl, rows, sty = load_profile(p)
         except (OSError, KeyError, ValueError) as e:
             return messagebox.showerror("Open", f"not a machine profile:\n{p}\n\n{e}")
         if not rows:
             return messagebox.showerror("Open", f"profile is empty:\n{p}")
         S.rows, S.meas, S.cursor, S.last = rows, {}, None, -1
+        S.style.set(sty)                 # Save writes it back in the style it was opened in
         model.delete(0, 'end'); model.insert(0, mdl or os.path.splitext(os.path.basename(p))[0])
         setpath(p)
         prender()
@@ -2155,7 +2175,8 @@ def wizard():
         if not p:
             return
         try:
-            save_profile(p, model.get().strip() or os.path.splitext(os.path.basename(p))[0], S.rows)
+            save_profile(p, model.get().strip() or os.path.splitext(os.path.basename(p))[0], S.rows,
+                         S.style.get())
         except (OSError, UnicodeError) as e:
             return messagebox.showerror("Save", f"could not write {p}\n\n{e}")
         setpath(p)
@@ -2530,7 +2551,7 @@ def wizard():
         note = (f"{model.get().strip() or base} [{'+'.join(picked)} spec restated at "
                 f"{g(target)} ohm, {mdl} model]")
         try:
-            save_profile(p, note, rows)
+            save_profile(p, note, rows, S.style.get())
         except (OSError, UnicodeError) as e:
             return messagebox.showerror("Convert", f"could not write {p}\n\n{e}")
         if messagebox.askyesno("Converted", f"{p}\n\nOpen it on tab 1 now?"):
@@ -2897,12 +2918,23 @@ def demo():
         save_profile(pp, 'Ellman', [
             {'mode': 'fulg', 'setting': 6.0, 'load_ohm': 500.0, 'expected_W': e1, 'tol_pct': t1},
             {'mode': 'cut', 'setting': 0.0, 'load_ohm': 500.0, 'expected_W': 3.5, 'tol_pct': 100.0}])
-        mdl, back = load_profile(pp)
+        mdl, back, _ = load_profile(pp)
         assert mdl == 'Ellman' and [r['mode'] for r in back] == ['cut', 'fulg']   # sorted on load
         lo, hi = band_to('minmax', back[1]['expected_W'], back[1]['tol_pct'])
         assert abs(lo - 25) < 1e-9 and abs(hi - 37) < 1e-9, (lo, hi)
         # the same file has to read back through the path --watch/--compare already use
         assert identify(ref_bands(pp), 'fulg', 30.0)[0] == [6]
+        # a min/max profile (the Excel-template way) reads the same band and saves back as min/max
+        _mp = os.path.join(td, 'mm.csv')
+        save_profile(_mp, 'Ellman', back, 'minmax')
+        with open(_mp, encoding='utf-8') as _f:
+            assert _f.readline().startswith('model,mode,setting,load_ohm,min_W,max_W'), 'header'
+            assert ',fulg,6,500,25,37,' in _f.read(), 'min/max must be written exactly'
+        _, _mb, _ms = load_profile(_mp)
+        assert _ms == 'minmax' and load_profile(pp)[2] == 'pm'
+        assert all(abs(x['expected_W'] - y['expected_W']) < 1e-9 and abs(x['tol_pct'] - y['tol_pct']) < 1e-9
+                   for x, y in zip(_mb, back))
+        assert identify(ref_bands(_mp), 'fulg', 30.0)[0] == [6]
         # A profile note carries Ω. Windows' default encoding is cp1252, which CANNOT encode it:
         # writing without encoding='utf-8' raised UnicodeEncodeError inside a Tk callback, which
         # in a --windowed exe goes nowhere -- the tech clicked Save and nothing happened.
