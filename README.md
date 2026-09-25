@@ -18,7 +18,14 @@ PDF report.
 *Mid-run. The banner is readable from across the bench — the generator is usually on a different
 table from the PC — and every row grades itself the moment the burst lands.*
 
-What it hands back: [a sample report](refs/examples/example-report.pdf) (made-up machine, made-up readings) — every mode on one chart.
+What it hands back — [a sample report](refs/examples/example-report.pdf) (made-up machine, made-up readings; click a page for full size):
+
+<p>
+  <img src="refs/examples/example-report%201%20of%202.png" width="49%" alt="Sample report page 1: every point graded, PASS/FAIL with deviation, grouped by mode">
+  <img src="refs/examples/example-report%202%20of%202.png" width="49%" alt="Sample report page 2: all four modes and 38 points on one measured-vs-spec chart, the one FAIL marked with an X">
+</p>
+
+*Page 1 grades every point; page 2 puts every mode on one chart. Coag 70 fails on purpose.*
 
 ## Who this is for
 
@@ -524,9 +531,7 @@ Under that, in the biggest type on the screen: **CUT · LEVEL 3**, and the expec
 so a long name (`bipolar, effect 8`) shifts the header with it instead of sliding the numbers out
 from under it.
 
-  ![Sample report, page 2: four modes, 38 points, one chart, the one FAIL marked with an X](refs/examples/example-report%202%20of%202.png)
-
-  *[Sample report](refs/examples/example-report.pdf) off [`example-minmax.csv`](refs/examples/example-minmax.csv) — page 1 is [the table](refs/examples/example-report%201%20of%202.png). Readings are made up; coag 70 fails on purpose.*
+  The two pages at the top of this README are exactly that, off [`example-minmax.csv`](refs/examples/example-minmax.csv).
 
 ### Tab 3 — Load convert (oddball spec load → a load you can build)
 An ERBE 200S is specified into **75 Ω**. A series-bypass load bank with a hardwired 100 Ω base
